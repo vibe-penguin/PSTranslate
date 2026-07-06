@@ -333,11 +333,24 @@
     function applyText(layer, translatedText, yaHeiFontName) {
         var textItem = layer.textItem;
         var state = captureTextItemState(textItem);
-        textItem.contents = String(translatedText);
-        if (yaHeiFontName) {
-            textItem.font = yaHeiFontName;
+
+        var originalDisplayDialogs = app.displayDialogs;
+        try {
+            app.displayDialogs = DialogModes.NO;
+
+            if (yaHeiFontName) {
+                try {
+                    textItem.font = yaHeiFontName;
+                } catch (fontError) {
+                    log("Could not set Microsoft YaHei before editing text: " + fontError);
+                }
+            }
+
+            textItem.contents = String(translatedText);
+        } finally {
+            restoreTextItemState(textItem, state);
+            app.displayDialogs = originalDisplayDialogs;
         }
-        restoreTextItemState(textItem, state);
     }
 
     function main() {

@@ -198,18 +198,27 @@ def extract_json_object(text: str) -> Dict[str, Any]:
     return data
 
 
-def build_messages(layer_id: str, protected_text: str, target_language: str) -> List[Dict[str, str]]:
+def build_batch_messages(items: List[Dict[str, Any]], target_language: str) -> List[Dict[str, str]]:
     system_prompt = (
         "You are a careful translation engine for Photoshop text layers. "
-        "Translate the user's text to the requested target language. "
+        "Translate every input item to the requested target language. "
         "Keep every protected token such as [[PST_PH_000]] exactly unchanged. "
+        "Return exactly one translation for every input item. "
+        "Do not deduplicate repeated text. "
+        "Preserve each layerId exactly. "
         "Do not add explanations, Markdown, or extra fields. Return strict JSON only."
     )
     user_payload = {
-        "layerId": layer_id,
         "targetLanguage": target_language,
-        "text": protected_text,
-        "returnSchema": {"layerId": layer_id, "translatedText": "string"},
+        "items": [
+            {"layerId": item["layer_id"], "text": item["protected_text"]}
+            for item in items
+        ],
+        "returnSchema": {
+            "translations": [
+                {"layerId": "same layerId from input item", "translatedText": "string"}
+            ]
+        },
     }
     return [
         {"role": "system", "content": system_prompt},
@@ -217,29 +226,61 @@ def build_messages(layer_id: str, protected_text: str, target_language: str) -> 
     ]
 
 
-def translate_one(layer: Dict[str, Any], config: Dict[str, Any], retries: int, retry_delay: float) -> str:
-    layer_id = str(layer.get("layerId", ""))
-    original_text = str(layer.get("originalText", ""))
+def parse_batch_response(raw: str, items: List[Dict[str, Any]]) -> Dict[str, str]:
+    model_data = extract_json_object(raw)
+    translations = model_data.get("translations")
+    if not isinstance(translations, list):
+        raise TranslationError("Model JSON must contain a translations array.")
+
+    expected = {item["layer_id"]: item for item in items}
+    results: Dict[str, str] = {}
+
+    for entry in translations:
+        if not isinstance(entry, dict):
+            raise TranslationError("Each translation entry must be an object.")
+
+        layer_id = str(entry.get("layerId", ""))
+        if layer_id not in expected:
+            raise TranslationError("Unexpected layerId in model response: %s" % layer_id)
+        if layer_id in results:
+            raise TranslationError("Duplicate layerId in model response: %s" % layer_id)
+
+        translated = str(entry.get("translatedText", ""))
+        placeholders = expected[layer_id]["placeholders"]
+        validate_placeholders(translated, placeholders)
+        results[layer_id] = restore_placeholders(translated, placeholders)
+
+    missing = [layer_id for layer_id in expected if layer_id not in results]
+    if missing:
+        raise TranslationError("Missing layerId(s) in model response: " + ", ".join(missing[:10]))
+
+    return results
+
+
+def translate_batch_once(items: List[Dict[str, Any]], config: Dict[str, Any]) -> Dict[str, str]:
     target_language = str(config["target_language"])
-    protected_text, placeholders = protect_placeholders(original_text)
-    messages = build_messages(layer_id, protected_text, target_language)
+    messages = build_batch_messages(items, target_language)
+    raw = call_chat_completion(config, messages)
+    return parse_batch_response(raw, items)
+
+
+def translate_batch_with_retries(
+    items: List[Dict[str, Any]],
+    config: Dict[str, Any],
+    retries: int,
+    retry_delay: float,
+) -> Dict[str, str]:
+    layer_ids = [item["layer_id"] for item in items]
     last_error: Optional[Exception] = None
 
     for attempt in range(retries + 1):
         try:
-            raw = call_chat_completion(config, messages)
-            model_data = extract_json_object(raw)
-            returned_id = str(model_data.get("layerId", ""))
-            if returned_id != layer_id:
-                raise TranslationError("LayerId mismatch: expected %s, got %s" % (layer_id, returned_id))
-            translated = str(model_data.get("translatedText", ""))
-            validate_placeholders(translated, placeholders)
-            return restore_placeholders(translated, placeholders)
+            return translate_batch_once(items, config)
         except Exception as exc:
             last_error = exc
             logging.warning(
-                "Layer %s translation attempt %s/%s failed: %s",
-                layer_id,
+                "Batch [%s] translation attempt %s/%s failed: %s",
+                ", ".join(layer_ids),
                 attempt + 1,
                 retries + 1,
                 exc,
@@ -250,16 +291,89 @@ def translate_one(layer: Dict[str, Any], config: Dict[str, Any], retries: int, r
     raise TranslationError(str(last_error))
 
 
+def translate_batch_resilient(
+    items: List[Dict[str, Any]],
+    config: Dict[str, Any],
+    retries: int,
+    retry_delay: float,
+) -> Tuple[Dict[str, str], Dict[str, str]]:
+    try:
+        return translate_batch_with_retries(items, config, retries, retry_delay), {}
+    except Exception as exc:
+        if len(items) == 1:
+            return {}, {items[0]["layer_id"]: str(exc)}
+
+        midpoint = max(1, len(items) // 2)
+        logging.warning(
+            "Batch [%s] failed after retries; splitting into %s and %s item(s).",
+            ", ".join(item["layer_id"] for item in items),
+            midpoint,
+            len(items) - midpoint,
+        )
+        left_results, left_errors = translate_batch_resilient(items[:midpoint], config, retries, retry_delay)
+        right_results, right_errors = translate_batch_resilient(items[midpoint:], config, retries, retry_delay)
+        left_results.update(right_results)
+        left_errors.update(right_errors)
+        return left_results, left_errors
+
+
 def iter_layers(payload: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
     for item in payload.get("layers", []):
         if isinstance(item, dict):
             yield item
 
 
+def positive_int(config: Dict[str, Any], key: str, default: int) -> int:
+    try:
+        value = int(config.get(key, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(1, value)
+
+
+def prepare_translation_item(layer: Dict[str, Any]) -> Dict[str, Any]:
+    original_text = str(layer.get("originalText", ""))
+    protected_text, placeholders = protect_placeholders(original_text)
+    return {
+        "layer": layer,
+        "layer_id": str(layer.get("layerId", "")),
+        "protected_text": protected_text,
+        "placeholders": placeholders,
+        "char_count": len(protected_text),
+    }
+
+
+def build_batches(items: List[Dict[str, Any]], batch_size: int, batch_max_chars: int) -> List[List[Dict[str, Any]]]:
+    batches: List[List[Dict[str, Any]]] = []
+    current: List[Dict[str, Any]] = []
+    current_chars = 0
+
+    for item in items:
+        item_chars = max(1, int(item.get("char_count", 0)))
+        should_flush = bool(current) and (
+            len(current) >= batch_size or current_chars + item_chars > batch_max_chars
+        )
+        if should_flush:
+            batches.append(current)
+            current = []
+            current_chars = 0
+
+        current.append(item)
+        current_chars += item_chars
+
+    if current:
+        batches.append(current)
+
+    return batches
+
+
 def translate_payload(payload: Dict[str, Any], config: Dict[str, Any], dry_run: bool) -> Dict[str, int]:
     retries = int(config.get("max_retries", 2))
     retry_delay = float(config.get("retry_delay_seconds", 2))
+    batch_size = positive_int(config, "batch_size", 20)
+    batch_max_chars = positive_int(config, "batch_max_chars", 6000)
     counts = {"translated": 0, "skipped": 0, "failed": 0}
+    pending_items: List[Dict[str, Any]] = []
 
     for layer in iter_layers(payload):
         layer_id = str(layer.get("layerId", ""))
@@ -282,19 +396,47 @@ def translate_payload(payload: Dict[str, Any], config: Dict[str, Any], dry_run: 
             logging.info("Dry-run checked layer %s (%s placeholder(s)).", layer_id, len(placeholders))
             continue
 
-        try:
-            translated = translate_one(layer, config, retries, retry_delay)
-            layer["translatedText"] = translated
-            layer["status"] = "translated"
-            layer["error"] = ""
-            counts["translated"] += 1
-            logging.info("Translated layer %s.", layer_id)
-        except Exception as exc:
-            layer["translatedText"] = ""
-            layer["status"] = "error"
-            layer["error"] = str(exc)
-            counts["failed"] += 1
-            logging.error("Layer %s failed and will be skipped: %s", layer_id, exc)
+        pending_items.append(prepare_translation_item(layer))
+
+    if dry_run or not pending_items:
+        return counts
+
+    batches = build_batches(pending_items, batch_size, batch_max_chars)
+    logging.info(
+        "Translating %s text layer(s) in %s batch(es). batch_size=%s, batch_max_chars=%s. "
+        "Deduplication and cache are disabled.",
+        len(pending_items),
+        len(batches),
+        batch_size,
+        batch_max_chars,
+    )
+
+    for index, batch in enumerate(batches, start=1):
+        logging.info(
+            "Translating batch %s/%s with %s layer(s): %s",
+            index,
+            len(batches),
+            len(batch),
+            ", ".join(item["layer_id"] for item in batch),
+        )
+
+        translations, errors = translate_batch_resilient(batch, config, retries, retry_delay)
+
+        for item in batch:
+            layer = item["layer"]
+            layer_id = item["layer_id"]
+            if layer_id in translations:
+                layer["translatedText"] = translations[layer_id]
+                layer["status"] = "translated"
+                layer["error"] = ""
+                counts["translated"] += 1
+                logging.info("Translated layer %s.", layer_id)
+            else:
+                layer["translatedText"] = ""
+                layer["status"] = "error"
+                layer["error"] = errors.get(layer_id, "Batch translation failed.")
+                counts["failed"] += 1
+                logging.error("Layer %s failed and will be skipped: %s", layer_id, layer["error"])
 
     return counts
 
@@ -334,6 +476,10 @@ def main(argv: List[str]) -> int:
     meta["dryRun"] = bool(args.dry_run)
     meta["targetLanguage"] = config.get("target_language", "")
     meta["model"] = config.get("model", "")
+    meta["batchSize"] = positive_int(config, "batch_size", 20)
+    meta["batchMaxChars"] = positive_int(config, "batch_max_chars", 6000)
+    meta["deduplication"] = False
+    meta["cache"] = False
 
     try:
         counts = translate_payload(payload, config, args.dry_run)

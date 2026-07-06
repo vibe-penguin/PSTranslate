@@ -46,12 +46,16 @@ Python 只使用标准库，不需要安装第三方包。
   "target_language": "简体中文",
   "temperature": 0.2,
   "timeout_seconds": 60,
+  "batch_size": 20,
+  "batch_max_chars": 6000,
   "max_retries": 2,
   "retry_delay_seconds": 2
 }
 ```
 
 `base_url` 填到 `/v1` 这一层即可，脚本会自动拼接 `/chat/completions`。如果不想把 key 写入文件，也可以把环境变量 `PST_LLM_API_KEY` 或 `OPENAI_API_KEY` 设为 API key。
+
+`batch_size` 控制每次请求最多翻译多少个文字图层，`batch_max_chars` 控制单次请求里受保护文本的总字符数上限。脚本不会对相同 `originalText` 去重，也不会使用翻译缓存；每个文字图层仍然会以自己的 `layerId` 独立进入批量请求。
 
 ## 一键使用步骤
 
@@ -106,6 +110,23 @@ Python 会在发送给 LLM 前保护这些内容，并在返回后恢复：
 - `<color=#fff>`、`</color>`、`<br/>` 等 HTML/XML-like 标签
 
 如果模型返回时丢失了保护 token，该图层会重试；重试后仍失败则标记为 `error`，Photoshop 回写时会跳过该图层，不会中断整个 PSD。
+
+## 批量翻译
+
+Python 会把多个文字图层合并到同一次 Chat Completions 请求中，并要求模型返回：
+
+```json
+{
+  "translations": [
+    {
+      "layerId": "123",
+      "translatedText": "翻译后的文本"
+    }
+  ]
+}
+```
+
+回写仍然只按 `layerId` 匹配，不依赖返回顺序。若某个批次返回格式不正确、缺少 `layerId` 或占位符丢失，脚本会先重试；仍失败时会自动把该批次拆成更小批次，最后只跳过失败图层。
 
 ## 重要说明
 

@@ -37,6 +37,50 @@ class TranslationError(RuntimeError):
     """Raised when one layer cannot be translated safely."""
 
 
+class ProgressReporter:
+    def __init__(self, path: Optional[Path], total: int) -> None:
+        self.path = path
+        self.total = max(0, total)
+        self.current = 0
+        self.started = time.time()
+        if self.path:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def write(self, stage: str, message: str, done: bool = False) -> None:
+        if not self.path:
+            return
+
+        elapsed = max(0.0, time.time() - self.started)
+        percent = 100.0 if self.total <= 0 else min(100.0, (self.current / float(self.total)) * 100.0)
+        eta: Optional[float] = None
+        if self.current > 0 and self.total > self.current and not done:
+            eta = (elapsed / float(self.current)) * float(self.total - self.current)
+        elif done:
+            eta = 0.0
+
+        payload = {
+            "stage": stage,
+            "message": message,
+            "current": self.current,
+            "total": self.total,
+            "percent": round(percent, 2),
+            "elapsedSeconds": round(elapsed, 1),
+            "etaSeconds": None if eta is None else round(eta, 1),
+            "done": bool(done),
+            "updatedAt": utc_now(),
+        }
+
+        temp_path = self.path.with_suffix(self.path.suffix + ".tmp")
+        with temp_path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.replace(temp_path, self.path)
+
+    def advance(self, count: int, stage: str, message: str) -> None:
+        self.current = min(self.total, self.current + max(0, count))
+        self.write(stage, message)
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -367,13 +411,21 @@ def build_batches(items: List[Dict[str, Any]], batch_size: int, batch_max_chars:
     return batches
 
 
-def translate_payload(payload: Dict[str, Any], config: Dict[str, Any], dry_run: bool) -> Dict[str, int]:
+def translate_payload(
+    payload: Dict[str, Any],
+    config: Dict[str, Any],
+    dry_run: bool,
+    progress: Optional[ProgressReporter] = None,
+) -> Dict[str, int]:
     retries = int(config.get("max_retries", 2))
     retry_delay = float(config.get("retry_delay_seconds", 2))
     batch_size = positive_int(config, "batch_size", 20)
     batch_max_chars = positive_int(config, "batch_max_chars", 6000)
     counts = {"translated": 0, "skipped": 0, "failed": 0}
     pending_items: List[Dict[str, Any]] = []
+
+    if progress:
+        progress.write("preparing", "Preparing text layers for translation.")
 
     for layer in iter_layers(payload):
         layer_id = str(layer.get("layerId", ""))
@@ -384,6 +436,8 @@ def translate_payload(payload: Dict[str, Any], config: Dict[str, Any], dry_run: 
             layer["status"] = "skipped"
             layer["error"] = "Empty text layer."
             counts["skipped"] += 1
+            if progress:
+                progress.advance(1, "preparing", "Skipped empty layer %s." % layer_id)
             continue
 
         if dry_run:
@@ -394,11 +448,15 @@ def translate_payload(payload: Dict[str, Any], config: Dict[str, Any], dry_run: 
             layer["error"] = ""
             counts["skipped"] += 1
             logging.info("Dry-run checked layer %s (%s placeholder(s)).", layer_id, len(placeholders))
+            if progress:
+                progress.advance(1, "dry-run", "Dry-run checked layer %s." % layer_id)
             continue
 
         pending_items.append(prepare_translation_item(layer))
 
     if dry_run or not pending_items:
+        if progress:
+            progress.write("complete", "No translation requests were needed.", done=True)
         return counts
 
     batches = build_batches(pending_items, batch_size, batch_max_chars)
@@ -411,7 +469,16 @@ def translate_payload(payload: Dict[str, Any], config: Dict[str, Any], dry_run: 
         batch_max_chars,
     )
 
+    if progress:
+        progress.write(
+            "translating",
+            "Translating %s text layer(s) in %s batch(es)." % (len(pending_items), len(batches)),
+        )
+
     for index, batch in enumerate(batches, start=1):
+        batch_message = "Translating batch %s/%s (%s layer(s))." % (index, len(batches), len(batch))
+        if progress:
+            progress.write("translating", batch_message)
         logging.info(
             "Translating batch %s/%s with %s layer(s): %s",
             index,
@@ -431,12 +498,19 @@ def translate_payload(payload: Dict[str, Any], config: Dict[str, Any], dry_run: 
                 layer["error"] = ""
                 counts["translated"] += 1
                 logging.info("Translated layer %s.", layer_id)
+                if progress:
+                    progress.advance(1, "translating", "Translated layer %s." % layer_id)
             else:
                 layer["translatedText"] = ""
                 layer["status"] = "error"
                 layer["error"] = errors.get(layer_id, "Batch translation failed.")
                 counts["failed"] += 1
                 logging.error("Layer %s failed and will be skipped: %s", layer_id, layer["error"])
+                if progress:
+                    progress.advance(1, "translating", "Layer %s failed and will be skipped." % layer_id)
+
+    if progress:
+        progress.write("complete", "Translation complete.", done=True)
 
     return counts
 
@@ -445,6 +519,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Translate Photoshop text-layer JSON.")
     parser.add_argument("--json", default=str(DEFAULT_JSON_PATH), help="Path to the temp JSON exported by Photoshop.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Path to config.json.")
+    parser.add_argument("--progress", default="", help="Optional path to a progress JSON file for Photoshop UI polling.")
     parser.add_argument("--dry-run", action="store_true", help="Validate JSON and placeholder protection without calling the LLM.")
     parser.add_argument("--debug", action="store_true", help="Enable verbose logs and keep the temp JSON during Photoshop apply.")
     return parser.parse_args(argv)
@@ -455,10 +530,13 @@ def main(argv: List[str]) -> int:
     log_path = setup_logging(args.debug)
     json_path = Path(args.json).expanduser().resolve()
     config_path = Path(args.config).expanduser().resolve()
+    progress_path = Path(args.progress).expanduser().resolve() if args.progress else None
 
     logging.info("Log file: %s", log_path)
     logging.info("JSON file: %s", json_path)
     logging.info("Config file: %s", config_path)
+    if progress_path:
+        logging.info("Progress file: %s", progress_path)
 
     try:
         payload = load_json(json_path)
@@ -480,15 +558,19 @@ def main(argv: List[str]) -> int:
     meta["batchMaxChars"] = positive_int(config, "batch_max_chars", 6000)
     meta["deduplication"] = False
     meta["cache"] = False
+    progress = ProgressReporter(progress_path, len(payload.get("layers", [])))
+    progress.write("starting", "Starting translation.")
 
     try:
-        counts = translate_payload(payload, config, args.dry_run)
+        counts = translate_payload(payload, config, args.dry_run, progress)
         meta["translationSummary"] = counts
         save_json(json_path, payload)
     except Exception as exc:
         logging.exception("Translation run failed before JSON could be saved: %s", exc)
+        progress.write("error", str(exc), done=True)
         return 1
 
+    progress.write("complete", "Translation JSON updated.", done=True)
     logging.info(
         "Finished. translated=%s skipped=%s failed=%s",
         counts["translated"],

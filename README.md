@@ -61,8 +61,10 @@ Python 只使用标准库，不需要安装第三方包。
 
 1. 在 Photoshop 中打开要处理的 PSD。
 2. 选择 `File > Scripts > Browse...`，运行 `photoshop_translate.jsx`。
-3. 等待翻译完成。
+3. 等待 Photoshop 内的 PSTranslate 进度窗口完成翻译。
 4. 检查 PSD，确认无误后手动保存。
+
+一键脚本会隐藏后台 Python/命令行执行窗口，并在 Photoshop 里显示进度条、已处理图层数和预计剩余时间。预计时间会随着已完成图层数动态估算，第一批请求完成前可能显示为 `calculating`。
 
 ## 手动 Debug 步骤
 
@@ -78,6 +80,8 @@ run_translate.bat
 
 4. 回到 Photoshop，再次选择 `File > Scripts > Browse...`，运行 `photoshop_apply.jsx`。
 5. 检查 PSD，确认无误后手动保存。
+
+手动 Debug 流程中的 `run_translate.bat` 会按普通命令行方式运行，可能显示 cmd 窗口；无窗口运行只用于 `photoshop_translate.jsx` 一键流程。
 
 ## Debug 和 Dry-run
 

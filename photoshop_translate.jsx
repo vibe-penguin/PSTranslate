@@ -42,8 +42,16 @@
         return new File(getDataFolder().fsName + "/python_exit_code.txt");
     }
 
+    function getProgressFile() {
+        return new File(getDataFolder().fsName + "/python_progress.json");
+    }
+
     function getRunnerBatFile() {
         return new File(getDataFolder().fsName + "/run_ps_text_translate.bat");
+    }
+
+    function getRunnerVbsFile() {
+        return new File(getDataFolder().fsName + "/run_ps_text_translate.vbs");
     }
 
     function getScriptFolder() {
@@ -180,6 +188,10 @@
         return "\"" + String(value).replace(/"/g, "\\\"") + "\"";
     }
 
+    function quoteVbsString(value) {
+        return "\"" + String(value).replace(/"/g, "\"\"") + "\"";
+    }
+
     function writeTextFile(file, text) {
         file.encoding = "UTF8";
         if (!file.open("w")) {
@@ -198,6 +210,142 @@
             $.sleep(250);
         }
         return true;
+    }
+
+    function formatDuration(seconds) {
+        if (seconds === null || typeof seconds === "undefined" || isNaN(Number(seconds))) {
+            return "calculating";
+        }
+        var value = Math.max(0, Math.round(Number(seconds)));
+        var minutes = Math.floor(value / 60);
+        var remainder = value % 60;
+        if (minutes <= 0) {
+            return remainder + "s";
+        }
+        return minutes + "m " + (remainder < 10 ? "0" + remainder : remainder) + "s";
+    }
+
+    function createProgressWindow(total) {
+        var win = new Window("palette", "PSTranslate");
+        win.orientation = "column";
+        win.alignChildren = "fill";
+        win.margins = 14;
+
+        var title = win.add("statictext", undefined, "Translating text layers...");
+        var bar = win.add("progressbar", undefined, 0, 100);
+        bar.preferredSize = [420, 18];
+        var detail = win.add("statictext", undefined, "Starting...");
+        var eta = win.add("statictext", undefined, "Progress: 0/" + total + " | ETA: calculating");
+
+        win.show();
+        win.update();
+
+        return {
+            window: win,
+            title: title,
+            bar: bar,
+            detail: detail,
+            eta: eta
+        };
+    }
+
+    function updateProgressWindow(progressWindow, progress) {
+        if (!progressWindow || !progress) {
+            return;
+        }
+
+        var percent = Number(progress.percent);
+        if (isNaN(percent)) {
+            percent = 0;
+        }
+        percent = Math.max(0, Math.min(100, percent));
+
+        var current = Number(progress.current);
+        if (isNaN(current)) {
+            current = 0;
+        }
+        var total = Number(progress.total);
+        if (isNaN(total)) {
+            total = 0;
+        }
+
+        progressWindow.bar.value = percent;
+        progressWindow.detail.text = String(progress.message || progress.stage || "Working...");
+        progressWindow.eta.text = "Progress: " + current + "/" + total +
+            " | " + Math.round(percent) + "%" +
+            " | ETA: " + formatDuration(progress.etaSeconds);
+        progressWindow.window.update();
+    }
+
+    function readProgress(progressFile) {
+        try {
+            if (!progressFile.exists) {
+                return null;
+            }
+            return readJson(progressFile);
+        } catch (e) {
+            log("Could not read progress JSON: " + e);
+            return null;
+        }
+    }
+
+    function countTextLayersInJsonFile(jsonFile) {
+        try {
+            var payload = readJson(jsonFile);
+            if (payload && payload.layers && payload.layers.length) {
+                return payload.layers.length;
+            }
+        } catch (e) {
+            log("Could not read text layer count: " + e);
+        }
+        return 0;
+    }
+
+    function waitForPythonProcess(exitCodeFile, progressFile, progressWindow) {
+        var started = new Date().getTime();
+        var sawProgress = false;
+        var progress;
+
+        while (!exitCodeFile.exists) {
+            progress = readProgress(progressFile);
+            if (progress) {
+                sawProgress = true;
+                updateProgressWindow(progressWindow, progress);
+            } else if (progressWindow) {
+                progressWindow.detail.text = "Starting Python translation...";
+                progressWindow.window.update();
+            }
+
+            if (!sawProgress && new Date().getTime() - started > 60000) {
+                throw new Error("Python translation did not start. No progress file was created.");
+            }
+
+            $.sleep(500);
+        }
+
+        progress = readProgress(progressFile);
+        if (progress) {
+            updateProgressWindow(progressWindow, progress);
+        }
+    }
+
+    function removeTempFile(file, description) {
+        try {
+            if (file.exists) {
+                file.remove();
+            }
+        } catch (e) {
+            log("Could not remove " + description + ": " + e);
+        }
+    }
+
+    function cleanupPythonRunnerFiles(exitCodeFile, runnerBatFile, runnerVbsFile, progressFile) {
+        removeTempFile(exitCodeFile, "Python exit-code file");
+        removeTempFile(runnerBatFile, "runner bat file");
+        removeTempFile(runnerVbsFile, "runner vbs file");
+        if (!DEBUG) {
+            removeTempFile(progressFile, "progress file");
+        }
     }
 
     function getLayerId(layer) {
@@ -474,7 +622,10 @@
         var pythonScript = new File(scriptFolder.fsName + "/" + PYTHON_SCRIPT_NAME);
         var configFile = new File(scriptFolder.fsName + "/" + CONFIG_FILE_NAME);
         var exitCodeFile = getExitCodeFile();
+        var progressFile = getProgressFile();
         var runnerBatFile = getRunnerBatFile();
+        var runnerVbsFile = getRunnerVbsFile();
+        var progressWindow = null;
 
         if (!pythonScript.exists) {
             throw new Error("Python script was not found: " + pythonScript.fsName);
@@ -487,13 +638,17 @@
             if (exitCodeFile.exists) {
                 exitCodeFile.remove();
             }
+            if (progressFile.exists) {
+                progressFile.remove();
+            }
         } catch (removeOldExitCodeError) {
-            log("Could not remove old exit-code file: " + removeOldExitCodeError);
+            log("Could not remove old temp status file: " + removeOldExitCodeError);
         }
 
         var pythonArgs = quoteArg(pythonScript.fsName) +
             " --json " + quoteArg(jsonFile.fsName) +
-            " --config " + quoteArg(configFile.fsName);
+            " --config " + quoteArg(configFile.fsName) +
+            " --progress " + quoteArg(progressFile.fsName);
 
         if (DEBUG) {
             pythonArgs += " --debug";
@@ -520,36 +675,39 @@
 
         writeTextFile(runnerBatFile, batLines.join("\r\n") + "\r\n");
 
-        var command = "cmd.exe /c " + quoteArg(runnerBatFile.fsName);
-        log("Running Python translation via: " + runnerBatFile.fsName);
+        var vbsLines = [];
+        vbsLines.push("Set shell = CreateObject(\"WScript.Shell\")");
+        vbsLines.push("shell.Run \"\"\"\" & " + quoteVbsString(runnerBatFile.fsName) + " & \"\"\"\", 0, False");
+        writeTextFile(runnerVbsFile, vbsLines.join("\r\n") + "\r\n");
 
-        app.system(command);
-
-        if (!waitForFile(exitCodeFile, 5000)) {
-            log("Python exit-code file was not created: " + exitCodeFile.fsName);
-            return 1;
-        }
-
-        var exitText = readTextFile(exitCodeFile).replace(/^\s+|\s+$/g, "");
-        var exitCode = Number(exitText);
-        if (isNaN(exitCode)) {
-            log("Could not parse Python exit code: " + exitText);
-            return 1;
-        }
+        var command = "wscript.exe " + quoteArg(runnerVbsFile.fsName);
+        log("Running hidden Python translation via: " + runnerVbsFile.fsName);
 
         try {
-            exitCodeFile.remove();
-        } catch (removeExitCodeError) {
-            log("Could not remove exit-code file: " + removeExitCodeError);
-        }
-        try {
-            runnerBatFile.remove();
-        } catch (removeRunnerError) {
-            log("Could not remove runner bat file: " + removeRunnerError);
-        }
+            app.system(command);
 
-        log("Python translation exit code: " + exitCode);
-        return exitCode;
+            progressWindow = createProgressWindow(countTextLayersInJsonFile(jsonFile));
+            waitForPythonProcess(exitCodeFile, progressFile, progressWindow);
+
+            var exitText = readTextFile(exitCodeFile).replace(/^\s+|\s+$/g, "");
+            var exitCode = Number(exitText);
+            if (isNaN(exitCode)) {
+                log("Could not parse Python exit code: " + exitText);
+                return 1;
+            }
+
+            log("Python translation exit code: " + exitCode);
+            return exitCode;
+        } finally {
+            if (progressWindow) {
+                try {
+                    progressWindow.window.close();
+                } catch (closeError) {
+                    log("Could not close progress window: " + closeError);
+                }
+            }
+            cleanupPythonRunnerFiles(exitCodeFile, runnerBatFile, runnerVbsFile, progressFile);
+        }
     }
 
     function applyTranslatedText(doc, jsonFile) {

@@ -258,25 +258,17 @@ def extract_json_object(text: str) -> Dict[str, Any]:
 
 def build_batch_messages(items: List[Dict[str, Any]], target_language: str) -> List[Dict[str, str]]:
     system_prompt = (
-        "You are a careful translation engine for Photoshop text layers. "
-        "Translate every input item to the requested target language. "
-        "Keep every protected token such as [[PST_PH_000]] exactly unchanged. "
-        "Return exactly one translation for every input item. "
-        "Do not deduplicate repeated text. "
-        "Preserve each layerId exactly. "
-        "Do not add explanations, Markdown, or extra fields. Return strict JSON only."
+        "Translate Photoshop text items to the target language. "
+        "Keep tokens like [[PST_PH_000]] unchanged. "
+        "Return strict JSON only: {\"translations\":{\"<id>\":\"translated text\"}}. "
+        "Use input ids as keys exactly once; preserve ids; do not deduplicate."
     )
     user_payload = {
-        "targetLanguage": target_language,
+        "target": target_language,
         "items": [
-            {"layerId": item["layer_id"], "text": item["protected_text"]}
+            [item["layer_id"], item["protected_text"]]
             for item in items
-        ],
-        "returnSchema": {
-            "translations": [
-                {"layerId": "same layerId from input item", "translatedText": "string"}
-            ]
-        },
+        ]
     }
     return [
         {"role": "system", "content": system_prompt},
@@ -284,26 +276,36 @@ def build_batch_messages(items: List[Dict[str, Any]], target_language: str) -> L
     ]
 
 
+def normalize_batch_translations(model_data: Dict[str, Any]) -> List[Tuple[str, str]]:
+    translations = model_data.get("translations")
+    if isinstance(translations, dict):
+        return [(str(layer_id), str(translated)) for layer_id, translated in translations.items()]
+
+    if isinstance(translations, list):
+        normalized: List[Tuple[str, str]] = []
+        for entry in translations:
+            if isinstance(entry, dict):
+                normalized.append((str(entry.get("layerId", "")), str(entry.get("translatedText", ""))))
+            elif isinstance(entry, list) and len(entry) >= 2:
+                normalized.append((str(entry[0]), str(entry[1])))
+            else:
+                raise TranslationError("Each translation entry must be an object or [layerId, text] pair.")
+        return normalized
+
+    raise TranslationError("Model JSON must contain a translations object.")
+
+
 def parse_batch_response(raw: str, items: List[Dict[str, Any]]) -> Dict[str, str]:
     model_data = extract_json_object(raw)
-    translations = model_data.get("translations")
-    if not isinstance(translations, list):
-        raise TranslationError("Model JSON must contain a translations array.")
-
     expected = {item["layer_id"]: item for item in items}
     results: Dict[str, str] = {}
 
-    for entry in translations:
-        if not isinstance(entry, dict):
-            raise TranslationError("Each translation entry must be an object.")
-
-        layer_id = str(entry.get("layerId", ""))
+    for layer_id, translated in normalize_batch_translations(model_data):
         if layer_id not in expected:
             raise TranslationError("Unexpected layerId in model response: %s" % layer_id)
         if layer_id in results:
             raise TranslationError("Duplicate layerId in model response: %s" % layer_id)
 
-        translated = str(entry.get("translatedText", ""))
         placeholders = expected[layer_id]["placeholders"]
         validate_placeholders(translated, placeholders)
         results[layer_id] = restore_placeholders(translated, placeholders)
@@ -433,8 +435,8 @@ def translate_payload(
 ) -> Dict[str, int]:
     retries = int(config.get("max_retries", 2))
     retry_delay = float(config.get("retry_delay_seconds", 2))
-    batch_size = positive_int(config, "batch_size", 20)
-    batch_max_chars = positive_int(config, "batch_max_chars", 6000)
+    batch_size = positive_int(config, "batch_size", 40)
+    batch_max_chars = positive_int(config, "batch_max_chars", 12000)
     counts = {"translated": 0, "skipped": 0, "failed": 0}
     pending_items: List[Dict[str, Any]] = []
 
@@ -568,8 +570,8 @@ def main(argv: List[str]) -> int:
     meta["dryRun"] = bool(args.dry_run)
     meta["targetLanguage"] = config.get("target_language", "")
     meta["model"] = config.get("model", "")
-    meta["batchSize"] = positive_int(config, "batch_size", 20)
-    meta["batchMaxChars"] = positive_int(config, "batch_max_chars", 6000)
+    meta["batchSize"] = positive_int(config, "batch_size", 40)
+    meta["batchMaxChars"] = positive_int(config, "batch_max_chars", 12000)
     meta["deduplication"] = False
     meta["cache"] = False
     progress = ProgressReporter(progress_path, len(payload.get("layers", [])))

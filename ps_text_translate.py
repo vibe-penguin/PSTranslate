@@ -70,11 +70,25 @@ class ProgressReporter:
             "updatedAt": utc_now(),
         }
 
-        temp_path = self.path.with_suffix(self.path.suffix + ".tmp")
-        with temp_path.open("w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-            f.write("\n")
-        os.replace(temp_path, self.path)
+        temp_path = self.path.with_name("%s.%s.tmp" % (self.path.name, os.getpid()))
+        last_error: Optional[OSError] = None
+        for attempt in range(8):
+            try:
+                with temp_path.open("w", encoding="utf-8") as f:
+                    json.dump(payload, f, ensure_ascii=False, indent=2)
+                    f.write("\n")
+                os.replace(temp_path, self.path)
+                return
+            except OSError as exc:
+                last_error = exc
+                try:
+                    if temp_path.exists():
+                        temp_path.unlink()
+                except OSError:
+                    pass
+                time.sleep(0.05 * (attempt + 1))
+
+        logging.warning("Could not update progress file %s: %s", self.path, last_error)
 
     def advance(self, count: int, stage: str, message: str) -> None:
         self.current = min(self.total, self.current + max(0, count))

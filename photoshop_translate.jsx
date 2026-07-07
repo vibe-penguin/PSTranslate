@@ -728,16 +728,6 @@
             state.hasJustification = true;
         } catch (e4) {
         }
-        try {
-            state.width = textItem.width;
-            state.hasWidth = true;
-        } catch (e5) {
-        }
-        try {
-            state.height = textItem.height;
-            state.hasHeight = true;
-        } catch (e6) {
-        }
         return state;
     }
 
@@ -764,23 +754,11 @@
             log("Could not restore text justification: " + e3);
         }
         try {
-            if (state.hasWidth) {
-                textItem.width = state.width;
-            }
-        } catch (e4) {
-        }
-        try {
-            if (state.hasHeight) {
-                textItem.height = state.height;
-            }
-        } catch (e5) {
-        }
-        try {
             if (state.hasPosition) {
                 textItem.position = state.position;
             }
-        } catch (e6) {
-            log("Could not restore text position: " + e6);
+        } catch (e4) {
+            log("Could not restore text position: " + e4);
         }
     }
 
@@ -920,6 +898,8 @@
         var failed = 0;
         var hadLayerErrors = false;
         var layers = payload.layers || [];
+        var appliedLayerIds = {};
+        var appliedTargetLayerIds = {};
 
         setProgressTarget(
             progressWindow,
@@ -985,11 +965,87 @@
                 continue;
             }
 
+            var targetLayerId = "";
+            try {
+                targetLayerId = String(getLayerId(layer));
+            } catch (targetIdError) {
+                failed++;
+                item.status = "apply_error";
+                item.error = "Could not verify target layerId: " + targetIdError;
+                hadLayerErrors = true;
+                log("Could not verify target layerId for " + layerId + " (" + item.layerPath + "): " + targetIdError);
+                setProgressTarget(
+                    progressWindow,
+                    mapRange(i + 1, 0, layers.length, PROGRESS_APPLY_START, PROGRESS_APPLY_END),
+                    "Skipping unverifiable text layer: " + (item.layerName || layerId),
+                    i + 1,
+                    layers.length,
+                    null,
+                    false
+                );
+                continue;
+            }
+            if (targetLayerId !== layerId) {
+                failed++;
+                item.status = "apply_error";
+                item.error = "Layer mapping mismatch. Expected layerId " + layerId + ", got " + targetLayerId + ".";
+                hadLayerErrors = true;
+                log("Layer mapping mismatch: expected " + layerId + ", got " + targetLayerId + " (" + item.layerPath + ")");
+                setProgressTarget(
+                    progressWindow,
+                    mapRange(i + 1, 0, layers.length, PROGRESS_APPLY_START, PROGRESS_APPLY_END),
+                    "Skipping mismatched text layer: " + (item.layerName || layerId),
+                    i + 1,
+                    layers.length,
+                    null,
+                    false
+                );
+                continue;
+            }
+
+            if (appliedLayerIds[layerId]) {
+                skipped++;
+                item.status = "apply_error";
+                item.error = "Duplicate layerId was already applied in this run.";
+                hadLayerErrors = true;
+                log("Duplicate layerId skipped during apply: " + layerId + " (" + item.layerPath + ")");
+                setProgressTarget(
+                    progressWindow,
+                    mapRange(i + 1, 0, layers.length, PROGRESS_APPLY_START, PROGRESS_APPLY_END),
+                    "Skipping duplicate text layer: " + (item.layerName || layerId),
+                    i + 1,
+                    layers.length,
+                    null,
+                    false
+                );
+                continue;
+            }
+
+            if (appliedTargetLayerIds[targetLayerId]) {
+                skipped++;
+                item.status = "apply_error";
+                item.error = "Target Photoshop layer was already applied in this run.";
+                hadLayerErrors = true;
+                log("Duplicate target layer skipped during apply: " + targetLayerId + " (" + item.layerPath + ")");
+                setProgressTarget(
+                    progressWindow,
+                    mapRange(i + 1, 0, layers.length, PROGRESS_APPLY_START, PROGRESS_APPLY_END),
+                    "Skipping duplicate target layer: " + (item.layerName || layerId),
+                    i + 1,
+                    layers.length,
+                    null,
+                    false
+                );
+                continue;
+            }
+
             try {
                 applyText(layer, item.translatedText, yaHeiFontName);
                 item.status = "applied";
                 item.error = "";
                 applied++;
+                appliedLayerIds[layerId] = true;
+                appliedTargetLayerIds[targetLayerId] = true;
             } catch (e) {
                 failed++;
                 item.status = "apply_error";

@@ -7,7 +7,6 @@
   "timeout_seconds": 60,
   "batch_size": 20,
   "batch_max_chars": 6000,
-  "concurrency": 3,
   "max_retries": 2,
   "retry_delay_seconds": 2
 }

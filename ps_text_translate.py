@@ -31,6 +31,7 @@ PLACEHOLDER_RE = re.compile(
     r"|(%\([A-Za-z_][A-Za-z0-9_]*\)[-+#0 ]*(?:\*|\d+)?(?:\.(?:\*|\d+))?[hlL]?[diuoxXfFeEgGcs])"
     r"|(\{(?:\d+|[A-Za-z_][A-Za-z0-9_]*)\})"
 )
+PROTECTED_TOKEN_RE = re.compile(r"\[\[PST_PH_\d{3}\]\]")
 
 
 class TranslationError(RuntimeError):
@@ -182,6 +183,11 @@ def validate_placeholders(text: str, placeholders: Dict[str, str]) -> None:
     missing = [token for token in placeholders if token not in text]
     if missing:
         raise TranslationError("Missing protected token(s): " + ", ".join(missing[:5]))
+
+
+def has_translatable_text(protected_text: str) -> bool:
+    visible_text = PROTECTED_TOKEN_RE.sub("", protected_text)
+    return any(ch.isalpha() for ch in visible_text)
 
 
 def content_to_text(content: Any) -> str:
@@ -456,19 +462,29 @@ def translate_payload(
                 progress.advance(1, "preparing", "Skipped empty layer %s." % layer_id)
             continue
 
+        item = prepare_translation_item(layer)
+        if not has_translatable_text(item["protected_text"]):
+            layer["translatedText"] = original_text
+            layer["status"] = "skipped"
+            layer["error"] = ""
+            counts["skipped"] += 1
+            logging.info("Skipped layer %s because it has no translatable text.", layer_id)
+            if progress:
+                progress.advance(1, "preparing", "Skipped non-translatable layer %s." % layer_id)
+            continue
+
         if dry_run:
-            protected_text, placeholders = protect_placeholders(original_text)
-            validate_placeholders(protected_text, placeholders)
+            validate_placeholders(item["protected_text"], item["placeholders"])
             layer["translatedText"] = original_text
             layer["status"] = "dry-run"
             layer["error"] = ""
             counts["skipped"] += 1
-            logging.info("Dry-run checked layer %s (%s placeholder(s)).", layer_id, len(placeholders))
+            logging.info("Dry-run checked layer %s (%s placeholder(s)).", layer_id, len(item["placeholders"]))
             if progress:
                 progress.advance(1, "dry-run", "Dry-run checked layer %s." % layer_id)
             continue
 
-        pending_items.append(prepare_translation_item(layer))
+        pending_items.append(item)
 
     if dry_run or not pending_items:
         if progress:

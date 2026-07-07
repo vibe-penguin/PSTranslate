@@ -706,70 +706,14 @@
         return fallback;
     }
 
-    function captureTextItemState(textItem) {
-        var state = {};
-        try {
-            state.size = textItem.size;
-            state.hasSize = true;
-        } catch (e1) {
-        }
-        try {
-            state.color = textItem.color;
-            state.hasColor = true;
-        } catch (e2) {
-        }
-        try {
-            state.position = textItem.position;
-            state.hasPosition = true;
-        } catch (e3) {
-        }
-        try {
-            state.justification = textItem.justification;
-            state.hasJustification = true;
-        } catch (e4) {
-        }
-        return state;
-    }
-
-    function restoreTextItemState(textItem, state) {
-        try {
-            if (state.hasSize) {
-                textItem.size = state.size;
-            }
-        } catch (e1) {
-            log("Could not restore text size: " + e1);
-        }
-        try {
-            if (state.hasColor) {
-                textItem.color = state.color;
-            }
-        } catch (e2) {
-            log("Could not restore text color: " + e2);
-        }
-        try {
-            if (state.hasJustification) {
-                textItem.justification = state.justification;
-            }
-        } catch (e3) {
-            log("Could not restore text justification: " + e3);
-        }
-        try {
-            if (state.hasPosition) {
-                textItem.position = state.position;
-            }
-        } catch (e4) {
-            log("Could not restore text position: " + e4);
-        }
-    }
-
     function applyText(layer, translatedText, yaHeiFontName) {
         var textItem = layer.textItem;
-        var state = captureTextItemState(textItem);
-
         var originalDisplayDialogs = app.displayDialogs;
         try {
             app.displayDialogs = DialogModes.NO;
 
+            // Do not write size/color/position/alignment back here. In some PSDs,
+            // Photoshop recomposes transformed type layers when those setters run.
             if (yaHeiFontName) {
                 try {
                     textItem.font = yaHeiFontName;
@@ -780,7 +724,6 @@
 
             textItem.contents = String(translatedText);
         } finally {
-            restoreTextItemState(textItem, state);
             app.displayDialogs = originalDisplayDialogs;
         }
     }

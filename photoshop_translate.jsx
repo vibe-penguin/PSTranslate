@@ -8,6 +8,13 @@
 
     var DEBUG = false;
     var DRY_RUN = false;
+    var PROGRESS_SCAN_END = 2;
+    var PROGRESS_EXPORT_START = 2;
+    var PROGRESS_EXPORT_END = 12;
+    var PROGRESS_TRANSLATE_START = 12;
+    var PROGRESS_TRANSLATE_END = 85;
+    var PROGRESS_APPLY_START = 85;
+    var PROGRESS_APPLY_END = 100;
 
     function pad2(value) {
         return value < 10 ? "0" + value : String(value);
@@ -225,17 +232,21 @@
         return minutes + "m " + (remainder < 10 ? "0" + remainder : remainder) + "s";
     }
 
+    function elapsedSecondsSince(startedAt) {
+        return Math.max(0, (new Date().getTime() - startedAt) / 1000);
+    }
+
     function createProgressWindow(total) {
         var win = new Window("palette", "PSTranslate");
         win.orientation = "column";
         win.alignChildren = "fill";
         win.margins = 14;
 
-        var title = win.add("statictext", undefined, "Translating text layers...");
+        var title = win.add("statictext", undefined, "Processing text layers...");
         var bar = win.add("progressbar", undefined, 0, 100);
         bar.preferredSize = [420, 18];
         var detail = win.add("statictext", undefined, "Starting...");
-        var eta = win.add("statictext", undefined, "Progress: 0/" + total + " | ETA: calculating");
+        var eta = win.add("statictext", undefined, "Progress: 0% | Elapsed: 0s | ETA: calculating");
 
         win.show();
         win.update();
@@ -245,36 +256,101 @@
             title: title,
             bar: bar,
             detail: detail,
-            eta: eta
+            eta: eta,
+            startedAt: new Date().getTime(),
+            displayPercent: 0,
+            targetPercent: 0,
+            message: "Starting...",
+            current: 0,
+            total: total || 0,
+            etaSeconds: null
         };
     }
 
-    function updateProgressWindow(progressWindow, progress) {
-        if (!progressWindow || !progress) {
+    function renderProgressWindow(progressWindow) {
+        if (!progressWindow) {
             return;
         }
 
-        var percent = Number(progress.percent);
+        var percent = Number(progressWindow.displayPercent);
         if (isNaN(percent)) {
             percent = 0;
         }
         percent = Math.max(0, Math.min(100, percent));
 
-        var current = Number(progress.current);
-        if (isNaN(current)) {
-            current = 0;
+        var lines = [];
+        if (progressWindow.total > 0) {
+            lines.push("Items: " + progressWindow.current + "/" + progressWindow.total);
         }
-        var total = Number(progress.total);
-        if (isNaN(total)) {
-            total = 0;
-        }
+        lines.push("Progress: " + Math.round(percent) + "%");
+        lines.push("Elapsed: " + formatDuration(elapsedSecondsSince(progressWindow.startedAt)));
+        lines.push("ETA: " + formatDuration(progressWindow.etaSeconds));
 
         progressWindow.bar.value = percent;
-        progressWindow.detail.text = String(progress.message || progress.stage || "Working...");
-        progressWindow.eta.text = "Progress: " + current + "/" + total +
-            " | " + Math.round(percent) + "%" +
-            " | ETA: " + formatDuration(progress.etaSeconds);
+        progressWindow.detail.text = progressWindow.message || "Working...";
+        progressWindow.eta.text = lines.join(" | ");
         progressWindow.window.update();
+    }
+
+    function tickProgressWindow(progressWindow, force) {
+        if (!progressWindow) {
+            return;
+        }
+
+        var target = Math.max(0, Math.min(100, Number(progressWindow.targetPercent)));
+        if (isNaN(target)) {
+            target = 0;
+        }
+
+        if (force) {
+            progressWindow.displayPercent = target;
+        } else if (progressWindow.displayPercent < target) {
+            var gap = target - progressWindow.displayPercent;
+            var step = Math.max(0.25, Math.min(6, gap * 0.25));
+            progressWindow.displayPercent = Math.min(target, progressWindow.displayPercent + step);
+        } else if (progressWindow.displayPercent > target) {
+            progressWindow.displayPercent = target;
+        }
+
+        renderProgressWindow(progressWindow);
+    }
+
+    function setProgressTarget(progressWindow, percent, message, current, total, etaSeconds, force) {
+        if (!progressWindow) {
+            return;
+        }
+
+        var target = Number(percent);
+        if (isNaN(target)) {
+            target = progressWindow.targetPercent;
+        }
+        target = Math.max(0, Math.min(100, target));
+
+        if (force || target > progressWindow.targetPercent) {
+            progressWindow.targetPercent = target;
+        }
+        if (message) {
+            progressWindow.message = String(message);
+        }
+        if (typeof current !== "undefined" && current !== null && !isNaN(Number(current))) {
+            progressWindow.current = Math.max(0, Math.round(Number(current)));
+        }
+        if (typeof total !== "undefined" && total !== null && !isNaN(Number(total))) {
+            progressWindow.total = Math.max(0, Math.round(Number(total)));
+        }
+        progressWindow.etaSeconds = etaSeconds;
+        tickProgressWindow(progressWindow, force);
+    }
+
+    function closeProgressWindow(progressWindow) {
+        if (!progressWindow) {
+            return;
+        }
+        try {
+            progressWindow.window.close();
+        } catch (closeError) {
+            log("Could not close progress window: " + closeError);
+        }
     }
 
     function readProgress(progressFile) {
@@ -301,23 +377,85 @@
         return 0;
     }
 
+    function mapRange(value, sourceStart, sourceEnd, targetStart, targetEnd) {
+        var ratio = 0;
+        if (sourceEnd !== sourceStart) {
+            ratio = (value - sourceStart) / (sourceEnd - sourceStart);
+        }
+        ratio = Math.max(0, Math.min(1, ratio));
+        return targetStart + (targetEnd - targetStart) * ratio;
+    }
+
+    function pythonCreepPercent(waitStartedAt) {
+        var elapsed = elapsedSecondsSince(waitStartedAt);
+        var ratio = Math.min(0.65, (elapsed / 180) * 0.65);
+        return PROGRESS_TRANSLATE_START +
+            (PROGRESS_TRANSLATE_END - PROGRESS_TRANSLATE_START) * ratio;
+    }
+
+    function updatePythonProgress(progressWindow, progress, waitStartedAt) {
+        if (!progressWindow || !progress) {
+            return;
+        }
+
+        var percent = Number(progress.percent);
+        if (isNaN(percent)) {
+            percent = 0;
+        }
+        var globalPercent = mapRange(
+            percent,
+            0,
+            100,
+            PROGRESS_TRANSLATE_START,
+            PROGRESS_TRANSLATE_END
+        );
+        if (!progress.done) {
+            globalPercent = Math.max(globalPercent, pythonCreepPercent(waitStartedAt));
+        } else {
+            globalPercent = PROGRESS_TRANSLATE_END;
+        }
+
+        setProgressTarget(
+            progressWindow,
+            globalPercent,
+            progress.message || progress.stage || "Translating text layers...",
+            progress.current,
+            progress.total,
+            progress.etaSeconds,
+            false
+        );
+    }
+
     function waitForPythonProcess(exitCodeFile, progressFile, progressWindow) {
         var started = new Date().getTime();
         var sawProgress = false;
+        var loggedMissingProgress = false;
         var progress;
 
         while (!exitCodeFile.exists) {
             progress = readProgress(progressFile);
             if (progress) {
                 sawProgress = true;
-                updateProgressWindow(progressWindow, progress);
+                updatePythonProgress(progressWindow, progress, started);
             } else if (progressWindow) {
-                progressWindow.detail.text = "Starting Python translation...";
-                progressWindow.window.update();
+                setProgressTarget(
+                    progressWindow,
+                    pythonCreepPercent(started),
+                    "Waiting for Python translation...",
+                    progressWindow.current,
+                    progressWindow.total,
+                    null,
+                    false
+                );
             }
 
-            if (!sawProgress && new Date().getTime() - started > 60000) {
-                throw new Error("Python translation did not start. No progress file was created.");
+            if (!sawProgress && !loggedMissingProgress && new Date().getTime() - started > 60000) {
+                loggedMissingProgress = true;
+                log("No Python progress file update after 60 seconds; continuing to wait for exit code.");
+            }
+
+            if (new Date().getTime() - started > 21600000) {
+                throw new Error("Python translation timed out after 6 hours.");
             }
 
             $.sleep(500);
@@ -325,7 +463,7 @@
 
         progress = readProgress(progressFile);
         if (progress) {
-            updateProgressWindow(progressWindow, progress);
+            updatePythonProgress(progressWindow, progress, started);
         }
     }
 
@@ -381,7 +519,42 @@
         return copy.join(" / ");
     }
 
-    function collectTextLayers(container, pathParts, result) {
+    function countTextLayers(container) {
+        var count = 0;
+        for (var i = 0; i < container.layers.length; i++) {
+            var layer = container.layers[i];
+            if (layer.typename === "LayerSet") {
+                count += countTextLayers(layer);
+            } else if (layer.typename === "ArtLayer" && layer.kind === LayerKind.TEXT) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    function updateExportProgress(progressWindow, progressState, layerName) {
+        if (!progressWindow || !progressState || progressState.total <= 0) {
+            return;
+        }
+        var percent = mapRange(
+            progressState.count,
+            0,
+            progressState.total,
+            PROGRESS_EXPORT_START,
+            PROGRESS_EXPORT_END
+        );
+        setProgressTarget(
+            progressWindow,
+            percent,
+            "Reading text layer: " + layerName,
+            progressState.count,
+            progressState.total,
+            null,
+            false
+        );
+    }
+
+    function collectTextLayers(container, pathParts, result, progressWindow, progressState) {
         for (var i = 0; i < container.layers.length; i++) {
             var layer = container.layers[i];
             if (layer.typename === "LayerSet") {
@@ -390,7 +563,7 @@
                     nextPath.push(pathParts[p]);
                 }
                 nextPath.push(layer.name);
-                collectTextLayers(layer, nextPath, result);
+                collectTextLayers(layer, nextPath, result, progressWindow, progressState);
             } else if (layer.typename === "ArtLayer" && layer.kind === LayerKind.TEXT) {
                 var layerInfo = {
                     layerId: getLayerId(layer),
@@ -409,6 +582,10 @@
                     log("Failed reading text for layer " + layerInfo.layerId + ": " + e);
                 }
                 result.push(layerInfo);
+                if (progressState) {
+                    progressState.count++;
+                    updateExportProgress(progressWindow, progressState, layer.name);
+                }
             }
         }
     }
@@ -432,9 +609,13 @@
         }
     }
 
-    function exportDocumentText(doc, jsonFile) {
+    function exportDocumentText(doc, jsonFile, progressWindow, totalTextLayers) {
         var layers = [];
-        collectTextLayers(doc, [], layers);
+        var progressState = {
+            count: 0,
+            total: totalTextLayers || 0
+        };
+        collectTextLayers(doc, [], layers, progressWindow, progressState);
 
         var payload = {
             meta: {
@@ -453,6 +634,15 @@
         };
 
         writeJson(jsonFile, payload);
+        setProgressTarget(
+            progressWindow,
+            PROGRESS_EXPORT_END,
+            "Text layer export complete.",
+            layers.length,
+            totalTextLayers || layers.length,
+            null,
+            true
+        );
         log("Exported " + layers.length + " text layer(s) to " + jsonFile.fsName);
         return layers.length;
     }
@@ -617,7 +807,7 @@
         }
     }
 
-    function runPythonTranslation(jsonFile) {
+    function runPythonTranslation(jsonFile, progressWindow) {
         var scriptFolder = getScriptFolder();
         var pythonScript = new File(scriptFolder.fsName + "/" + PYTHON_SCRIPT_NAME);
         var configFile = new File(scriptFolder.fsName + "/" + CONFIG_FILE_NAME);
@@ -625,7 +815,6 @@
         var progressFile = getProgressFile();
         var runnerBatFile = getRunnerBatFile();
         var runnerVbsFile = getRunnerVbsFile();
-        var progressWindow = null;
 
         if (!pythonScript.exists) {
             throw new Error("Python script was not found: " + pythonScript.fsName);
@@ -684,9 +873,17 @@
         log("Running hidden Python translation via: " + runnerVbsFile.fsName);
 
         try {
+            setProgressTarget(
+                progressWindow,
+                PROGRESS_TRANSLATE_START,
+                "Starting Python translation...",
+                0,
+                countTextLayersInJsonFile(jsonFile),
+                null,
+                true
+            );
             app.system(command);
 
-            progressWindow = createProgressWindow(countTextLayersInJsonFile(jsonFile));
             waitForPythonProcess(exitCodeFile, progressFile, progressWindow);
 
             var exitText = readTextFile(exitCodeFile).replace(/^\s+|\s+$/g, "");
@@ -699,18 +896,11 @@
             log("Python translation exit code: " + exitCode);
             return exitCode;
         } finally {
-            if (progressWindow) {
-                try {
-                    progressWindow.window.close();
-                } catch (closeError) {
-                    log("Could not close progress window: " + closeError);
-                }
-            }
             cleanupPythonRunnerFiles(exitCodeFile, runnerBatFile, runnerVbsFile, progressFile);
         }
     }
 
-    function applyTranslatedText(doc, jsonFile) {
+    function applyTranslatedText(doc, jsonFile, progressWindow) {
         var payload = readJson(jsonFile);
         var meta = payload.meta || {};
         var debug = meta.debug === true;
@@ -731,6 +921,16 @@
         var hadLayerErrors = false;
         var layers = payload.layers || [];
 
+        setProgressTarget(
+            progressWindow,
+            PROGRESS_APPLY_START,
+            "Preparing to replace text layers...",
+            0,
+            layers.length,
+            null,
+            true
+        );
+
         for (var i = 0; i < layers.length; i++) {
             var item = layers[i];
             var layerId = String(item.layerId);
@@ -740,12 +940,30 @@
                 if (item.status === "error" || item.status === "apply_error" || item.error) {
                     hadLayerErrors = true;
                 }
+                setProgressTarget(
+                    progressWindow,
+                    mapRange(i + 1, 0, layers.length, PROGRESS_APPLY_START, PROGRESS_APPLY_END),
+                    "Skipping text layer: " + (item.layerName || layerId),
+                    i + 1,
+                    layers.length,
+                    null,
+                    false
+                );
                 continue;
             }
 
             if (dryRun) {
                 skipped++;
                 item.status = "dry-run";
+                setProgressTarget(
+                    progressWindow,
+                    mapRange(i + 1, 0, layers.length, PROGRESS_APPLY_START, PROGRESS_APPLY_END),
+                    "Dry-run checked text layer: " + (item.layerName || layerId),
+                    i + 1,
+                    layers.length,
+                    null,
+                    false
+                );
                 continue;
             }
 
@@ -755,6 +973,15 @@
                 item.status = "apply_error";
                 item.error = "Layer not found in active document.";
                 log("Layer not found: " + layerId + " (" + item.layerPath + ")");
+                setProgressTarget(
+                    progressWindow,
+                    mapRange(i + 1, 0, layers.length, PROGRESS_APPLY_START, PROGRESS_APPLY_END),
+                    "Text layer not found: " + (item.layerName || layerId),
+                    i + 1,
+                    layers.length,
+                    null,
+                    false
+                );
                 continue;
             }
 
@@ -769,6 +996,15 @@
                 item.error = String(e);
                 log("Failed applying layer " + layerId + ": " + e);
             }
+            setProgressTarget(
+                progressWindow,
+                mapRange(i + 1, 0, layers.length, PROGRESS_APPLY_START, PROGRESS_APPLY_END),
+                "Replacing text layer: " + (item.layerName || layerId),
+                i + 1,
+                layers.length,
+                null,
+                false
+            );
         }
 
         meta.appliedAt = isoNow();
@@ -806,9 +1042,10 @@
         };
     }
 
-    function buildSummaryMessage(exportedCount, pythonExitCode, applyResult, jsonFile) {
+    function buildSummaryMessage(exportedCount, pythonExitCode, applyResult, jsonFile, totalSeconds) {
         var lines = [];
         lines.push("PSTranslate complete.");
+        lines.push("Total time: " + formatDuration(totalSeconds));
         lines.push("Exported text layers: " + exportedCount);
         lines.push("Python exit code: " + pythonExitCode);
 
@@ -845,17 +1082,34 @@
         var originalRulerUnits = app.preferences.rulerUnits;
         var originalActiveLayer = doc.activeLayer;
         var jsonFile = getDefaultJsonFile();
+        var startedAt = new Date().getTime();
+        var progressWindow = null;
 
         try {
             app.preferences.rulerUnits = Units.PIXELS;
 
-            var exportedCount = exportDocumentText(doc, jsonFile);
+            progressWindow = createProgressWindow(0);
+            setProgressTarget(progressWindow, 0, "Scanning active document...", 0, 0, null, true);
+            var totalTextLayers = countTextLayers(doc);
+            setProgressTarget(
+                progressWindow,
+                PROGRESS_SCAN_END,
+                "Found " + totalTextLayers + " text layer(s).",
+                0,
+                totalTextLayers,
+                null,
+                true
+            );
+
+            var exportedCount = exportDocumentText(doc, jsonFile, progressWindow, totalTextLayers);
             if (exportedCount === 0) {
+                closeProgressWindow(progressWindow);
+                progressWindow = null;
                 alert("No text layers were found in the active document.");
                 return;
             }
 
-            var pythonExitCode = runPythonTranslation(jsonFile);
+            var pythonExitCode = runPythonTranslation(jsonFile, progressWindow);
             if (!jsonFile.exists) {
                 throw new Error("Translation JSON disappeared after Python run: " + jsonFile.fsName);
             }
@@ -863,17 +1117,42 @@
                 throw new Error("Python translation failed before usable layer results were produced. Exit code: " + pythonExitCode);
             }
 
-            var applyResult = applyTranslatedText(doc, jsonFile);
+            var applyResult = applyTranslatedText(doc, jsonFile, progressWindow);
+            var totalSeconds = elapsedSecondsSince(startedAt);
+            setProgressTarget(
+                progressWindow,
+                PROGRESS_APPLY_END,
+                "PSTranslate complete.",
+                exportedCount,
+                exportedCount,
+                0,
+                true
+            );
+            $.sleep(300);
+            closeProgressWindow(progressWindow);
+            progressWindow = null;
             log("One-click finished. Exported=" + exportedCount +
                 ", pythonExitCode=" + pythonExitCode +
                 ", applied=" + applyResult.applied +
                 ", skipped=" + applyResult.skipped +
-                ", failed=" + applyResult.failed);
-            alert(buildSummaryMessage(exportedCount, pythonExitCode, applyResult, jsonFile));
+                ", failed=" + applyResult.failed +
+                ", elapsed=" + formatDuration(totalSeconds));
+            alert(buildSummaryMessage(exportedCount, pythonExitCode, applyResult, jsonFile, totalSeconds));
         } catch (e) {
-            log("One-click failed: " + e);
-            alert("PSTranslate failed:\n" + e + "\n\nTemporary JSON, if created:\n" + jsonFile.fsName + "\n\nLog:\n" + getLogFile().fsName);
+            var failureSeconds = elapsedSecondsSince(startedAt);
+            if (progressWindow) {
+                setProgressTarget(progressWindow, progressWindow.displayPercent, "PSTranslate failed.", 0, 0, 0, true);
+                $.sleep(150);
+                closeProgressWindow(progressWindow);
+                progressWindow = null;
+            }
+            log("One-click failed after " + formatDuration(failureSeconds) + ": " + e);
+            alert("PSTranslate failed:\n" + e +
+                "\n\nElapsed: " + formatDuration(failureSeconds) +
+                "\n\nTemporary JSON, if created:\n" + jsonFile.fsName +
+                "\n\nLog:\n" + getLogFile().fsName);
         } finally {
+            closeProgressWindow(progressWindow);
             try {
                 doc.activeLayer = originalActiveLayer;
             } catch (ignored) {

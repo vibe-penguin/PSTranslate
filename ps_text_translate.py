@@ -13,6 +13,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Match, Optional, Tuple
@@ -425,6 +426,117 @@ def build_batches(items: List[Dict[str, Any]], batch_size: int, batch_max_chars:
     return batches
 
 
+def apply_batch_result(
+    batch: List[Dict[str, Any]],
+    translations: Dict[str, str],
+    errors: Dict[str, str],
+    counts: Dict[str, int],
+    progress: Optional[ProgressReporter],
+) -> None:
+    for item in batch:
+        layer = item["layer"]
+        layer_id = item["layer_id"]
+        if layer_id in translations:
+            layer["translatedText"] = translations[layer_id]
+            layer["status"] = "translated"
+            layer["error"] = ""
+            counts["translated"] += 1
+            logging.info("Translated layer %s.", layer_id)
+            if progress:
+                progress.advance(1, "translating", "Translated layer %s." % layer_id)
+        else:
+            layer["translatedText"] = ""
+            layer["status"] = "error"
+            layer["error"] = errors.get(layer_id, "Batch translation failed.")
+            counts["failed"] += 1
+            logging.error("Layer %s failed and will be skipped: %s", layer_id, layer["error"])
+            if progress:
+                progress.advance(1, "translating", "Layer %s failed and will be skipped." % layer_id)
+
+
+def translate_one_batch_task(
+    index: int,
+    total_batches: int,
+    batch: List[Dict[str, Any]],
+    config: Dict[str, Any],
+    retries: int,
+    retry_delay: float,
+) -> Tuple[int, List[Dict[str, Any]], Dict[str, str], Dict[str, str], float]:
+    started = time.time()
+    logging.info(
+        "Translating batch %s/%s with %s layer(s): %s",
+        index,
+        total_batches,
+        len(batch),
+        ", ".join(item["layer_id"] for item in batch),
+    )
+    translations, errors = translate_batch_resilient(batch, config, retries, retry_delay)
+    return index, batch, translations, errors, max(0.0, time.time() - started)
+
+
+def translate_batches(
+    batches: List[List[Dict[str, Any]]],
+    config: Dict[str, Any],
+    retries: int,
+    retry_delay: float,
+    concurrency: int,
+    counts: Dict[str, int],
+    progress: Optional[ProgressReporter],
+) -> None:
+    total_batches = len(batches)
+    if total_batches <= 0:
+        return
+
+    worker_count = min(max(1, concurrency), total_batches)
+    if worker_count <= 1:
+        for index, batch in enumerate(batches, start=1):
+            batch_message = "Translating batch %s/%s (%s layer(s))." % (index, total_batches, len(batch))
+            if progress:
+                progress.write("translating", batch_message)
+            _, result_batch, translations, errors, elapsed = translate_one_batch_task(
+                index,
+                total_batches,
+                batch,
+                config,
+                retries,
+                retry_delay,
+            )
+            logging.info("Batch %s/%s finished in %.1fs.", index, total_batches, elapsed)
+            apply_batch_result(result_batch, translations, errors, counts, progress)
+        return
+
+    logging.info("Running up to %s batch translation request(s) concurrently.", worker_count)
+    if progress:
+        progress.write(
+            "translating",
+            "Running up to %s batch request(s) concurrently." % worker_count,
+        )
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_to_index = {}
+        for index, batch in enumerate(batches, start=1):
+            future = executor.submit(
+                translate_one_batch_task,
+                index,
+                total_batches,
+                batch,
+                config,
+                retries,
+                retry_delay,
+            )
+            future_to_index[future] = index
+
+        for future in as_completed(future_to_index):
+            index, batch, translations, errors, elapsed = future.result()
+            logging.info("Batch %s/%s finished in %.1fs.", index, total_batches, elapsed)
+            if progress:
+                progress.write(
+                    "translating",
+                    "Finished batch %s/%s; applying layer results." % (index, total_batches),
+                )
+            apply_batch_result(batch, translations, errors, counts, progress)
+
+
 def translate_payload(
     payload: Dict[str, Any],
     config: Dict[str, Any],
@@ -435,6 +547,7 @@ def translate_payload(
     retry_delay = float(config.get("retry_delay_seconds", 2))
     batch_size = positive_int(config, "batch_size", 20)
     batch_max_chars = positive_int(config, "batch_max_chars", 6000)
+    concurrency = positive_int(config, "concurrency", 3)
     counts = {"translated": 0, "skipped": 0, "failed": 0}
     pending_items: List[Dict[str, Any]] = []
 
@@ -475,53 +588,23 @@ def translate_payload(
 
     batches = build_batches(pending_items, batch_size, batch_max_chars)
     logging.info(
-        "Translating %s text layer(s) in %s batch(es). batch_size=%s, batch_max_chars=%s. "
+        "Translating %s text layer(s) in %s batch(es). batch_size=%s, batch_max_chars=%s, concurrency=%s. "
         "Deduplication and cache are disabled.",
         len(pending_items),
         len(batches),
         batch_size,
         batch_max_chars,
+        min(concurrency, len(batches)),
     )
 
     if progress:
         progress.write(
             "translating",
-            "Translating %s text layer(s) in %s batch(es)." % (len(pending_items), len(batches)),
+            "Translating %s text layer(s) in %s batch(es), concurrency %s."
+            % (len(pending_items), len(batches), min(concurrency, len(batches))),
         )
 
-    for index, batch in enumerate(batches, start=1):
-        batch_message = "Translating batch %s/%s (%s layer(s))." % (index, len(batches), len(batch))
-        if progress:
-            progress.write("translating", batch_message)
-        logging.info(
-            "Translating batch %s/%s with %s layer(s): %s",
-            index,
-            len(batches),
-            len(batch),
-            ", ".join(item["layer_id"] for item in batch),
-        )
-
-        translations, errors = translate_batch_resilient(batch, config, retries, retry_delay)
-
-        for item in batch:
-            layer = item["layer"]
-            layer_id = item["layer_id"]
-            if layer_id in translations:
-                layer["translatedText"] = translations[layer_id]
-                layer["status"] = "translated"
-                layer["error"] = ""
-                counts["translated"] += 1
-                logging.info("Translated layer %s.", layer_id)
-                if progress:
-                    progress.advance(1, "translating", "Translated layer %s." % layer_id)
-            else:
-                layer["translatedText"] = ""
-                layer["status"] = "error"
-                layer["error"] = errors.get(layer_id, "Batch translation failed.")
-                counts["failed"] += 1
-                logging.error("Layer %s failed and will be skipped: %s", layer_id, layer["error"])
-                if progress:
-                    progress.advance(1, "translating", "Layer %s failed and will be skipped." % layer_id)
+    translate_batches(batches, config, retries, retry_delay, concurrency, counts, progress)
 
     if progress:
         progress.write("complete", "Translation complete.", done=True)
@@ -570,6 +653,7 @@ def main(argv: List[str]) -> int:
     meta["model"] = config.get("model", "")
     meta["batchSize"] = positive_int(config, "batch_size", 20)
     meta["batchMaxChars"] = positive_int(config, "batch_max_chars", 6000)
+    meta["concurrency"] = positive_int(config, "concurrency", 3)
     meta["deduplication"] = False
     meta["cache"] = False
     progress = ProgressReporter(progress_path, len(payload.get("layers", [])))

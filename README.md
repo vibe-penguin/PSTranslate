@@ -46,8 +46,8 @@ Python 只使用标准库，不需要安装第三方包。
   "target_language": "简体中文",
   "temperature": 0.2,
   "timeout_seconds": 60,
-  "batch_size": 40,
-  "batch_max_chars": 12000,
+  "batch_size": 20,
+  "batch_max_chars": 6000,
   "max_retries": 2,
   "retry_delay_seconds": 2
 }
@@ -55,7 +55,7 @@ Python 只使用标准库，不需要安装第三方包。
 
 `base_url` 填到 `/v1` 这一层即可，脚本会自动拼接 `/chat/completions`。如果不想把 key 写入文件，也可以把环境变量 `PST_LLM_API_KEY` 或 `OPENAI_API_KEY` 设为 API key。
 
-`batch_size` 控制每次请求最多翻译多少个文字图层，`batch_max_chars` 控制单次请求里受保护文本的总字符数上限。默认值会尽量让常见 PSD 合并为更少请求，减少 API 往返。脚本不会对相同 `originalText` 去重，也不会使用翻译缓存；每个文字图层仍然会以自己的 `layerId` 独立进入批量请求。
+`batch_size` 控制每次请求最多翻译多少个文字图层，`batch_max_chars` 控制单次请求里受保护文本的总字符数上限。默认值偏保守，避免某些模型或 API 网关在大 batch 上长时间超时；如果多图层 batch 超时，脚本会自动拆成更小的 batch 继续翻译。脚本不会对相同 `originalText` 去重，也不会使用翻译缓存；每个文字图层仍然会以自己的 `layerId` 独立进入批量请求。
 
 ## 一键使用步骤
 

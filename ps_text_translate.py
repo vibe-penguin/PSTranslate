@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import socket
 import sys
 import tempfile
 import time
@@ -21,6 +22,8 @@ from typing import Any, Dict, Iterable, List, Match, Optional, Tuple
 DEFAULT_JSON_PATH = Path(tempfile.gettempdir()) / "PSTranslate" / "ps_text_layers.json"
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = SCRIPT_DIR / "config.json"
+DEFAULT_BATCH_SIZE = 20
+DEFAULT_BATCH_MAX_CHARS = 6000
 
 
 PLACEHOLDER_RE = re.compile(
@@ -38,6 +41,10 @@ CLOSING_WRAPPERS = "\"')]}>”’）】》」』"
 
 class TranslationError(RuntimeError):
     """Raised when one layer cannot be translated safely."""
+
+
+class TimeoutTranslationError(TranslationError):
+    """Raised when the API request times out."""
 
 
 class ProgressReporter:
@@ -252,6 +259,18 @@ def content_to_text(content: Any) -> str:
     return str(content)
 
 
+def is_timeout_error(exc: BaseException) -> bool:
+    if isinstance(exc, (TimeoutTranslationError, TimeoutError, socket.timeout)):
+        return True
+
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, (TimeoutError, socket.timeout)):
+        return True
+
+    text = str(exc).lower()
+    return "timed out" in text or "timeout" in text
+
+
 def call_chat_completion(config: Dict[str, Any], messages: List[Dict[str, str]]) -> str:
     url = normalize_chat_url(str(config["base_url"]))
     timeout = int(config.get("timeout_seconds", 60))
@@ -280,7 +299,11 @@ def call_chat_completion(config: Dict[str, Any], messages: List[Dict[str, str]])
     except urllib.error.HTTPError as exc:
         error_body = exc.read().decode("utf-8", errors="replace")
         raise TranslationError("HTTP %s: %s" % (exc.code, error_body[:1000])) from exc
+    except (TimeoutError, socket.timeout) as exc:
+        raise TimeoutTranslationError("Network timeout after %s second(s): %s" % (timeout, exc)) from exc
     except urllib.error.URLError as exc:
+        if is_timeout_error(exc):
+            raise TimeoutTranslationError("Network timeout after %s second(s): %s" % (timeout, exc)) from exc
         raise TranslationError("Network error: %s" % exc) from exc
 
     try:
@@ -391,17 +414,33 @@ def translate_batch_with_retries(
     last_error: Optional[Exception] = None
 
     for attempt in range(retries + 1):
+        attempt_started = time.time()
         try:
-            return translate_batch_once(items, config)
-        except Exception as exc:
-            last_error = exc
-            logging.warning(
-                "Batch [%s] translation attempt %s/%s failed: %s",
+            results = translate_batch_once(items, config)
+            logging.info(
+                "Batch [%s] translation attempt %s/%s succeeded in %.1fs.",
                 ", ".join(layer_ids),
                 attempt + 1,
                 retries + 1,
+                time.time() - attempt_started,
+            )
+            return results
+        except Exception as exc:
+            last_error = exc
+            logging.warning(
+                "Batch [%s] translation attempt %s/%s failed after %.1fs: %s",
+                ", ".join(layer_ids),
+                attempt + 1,
+                retries + 1,
+                time.time() - attempt_started,
                 exc,
             )
+            if len(items) > 1 and is_timeout_error(exc):
+                logging.warning(
+                    "Batch [%s] timed out; splitting it before retrying the same oversized request.",
+                    ", ".join(layer_ids),
+                )
+                raise
             if attempt < retries:
                 time.sleep(retry_delay)
 
@@ -421,9 +460,11 @@ def translate_batch_resilient(
             return {}, {items[0]["layer_id"]: str(exc)}
 
         midpoint = max(1, len(items) // 2)
+        reason = "timed out" if is_timeout_error(exc) else "failed after retries"
         logging.warning(
-            "Batch [%s] failed after retries; splitting into %s and %s item(s).",
+            "Batch [%s] %s; splitting into %s and %s item(s).",
             ", ".join(item["layer_id"] for item in items),
+            reason,
             midpoint,
             len(items) - midpoint,
         )
@@ -492,8 +533,8 @@ def translate_payload(
 ) -> Dict[str, int]:
     retries = int(config.get("max_retries", 2))
     retry_delay = float(config.get("retry_delay_seconds", 2))
-    batch_size = positive_int(config, "batch_size", 40)
-    batch_max_chars = positive_int(config, "batch_max_chars", 12000)
+    batch_size = positive_int(config, "batch_size", DEFAULT_BATCH_SIZE)
+    batch_max_chars = positive_int(config, "batch_max_chars", DEFAULT_BATCH_MAX_CHARS)
     counts = {"translated": 0, "skipped": 0, "failed": 0}
     pending_items: List[Dict[str, Any]] = []
 
@@ -562,6 +603,7 @@ def translate_payload(
         batch_message = "Translating batch %s/%s (%s layer(s))." % (index, len(batches), len(batch))
         if progress:
             progress.write("translating", batch_message)
+        batch_started = time.time()
         logging.info(
             "Translating batch %s/%s with %s layer(s): %s",
             index,
@@ -571,6 +613,12 @@ def translate_payload(
         )
 
         translations, errors = translate_batch_resilient(batch, config, retries, retry_delay)
+        logging.info(
+            "Batch %s/%s finished in %.1fs.",
+            index,
+            len(batches),
+            time.time() - batch_started,
+        )
 
         for item in batch:
             layer = item["layer"]
@@ -637,8 +685,8 @@ def main(argv: List[str]) -> int:
     meta["dryRun"] = bool(args.dry_run)
     meta["targetLanguage"] = config.get("target_language", "")
     meta["model"] = config.get("model", "")
-    meta["batchSize"] = positive_int(config, "batch_size", 40)
-    meta["batchMaxChars"] = positive_int(config, "batch_max_chars", 12000)
+    meta["batchSize"] = positive_int(config, "batch_size", DEFAULT_BATCH_SIZE)
+    meta["batchMaxChars"] = positive_int(config, "batch_max_chars", DEFAULT_BATCH_MAX_CHARS)
     meta["deduplication"] = False
     meta["cache"] = False
     progress = ProgressReporter(progress_path, len(payload.get("layers", [])))

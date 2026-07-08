@@ -32,6 +32,8 @@ PLACEHOLDER_RE = re.compile(
     r"|(\{(?:\d+|[A-Za-z_][A-Za-z0-9_]*)\})"
 )
 PROTECTED_TOKEN_RE = re.compile(r"\[\[PST_PH_\d{3}\]\]")
+TERMINAL_PUNCTUATION = ".。．!！?？,，、;；:：…"
+CLOSING_WRAPPERS = "\"')]}>”’）】》」』"
 
 
 class TranslationError(RuntimeError):
@@ -190,6 +192,52 @@ def has_translatable_text(protected_text: str) -> bool:
     return any(ch.isalpha() for ch in visible_text)
 
 
+def has_terminal_punctuation(protected_text: str) -> bool:
+    visible_text = PROTECTED_TOKEN_RE.sub("", protected_text).rstrip()
+    while visible_text and visible_text[-1] in CLOSING_WRAPPERS:
+        visible_text = visible_text[:-1].rstrip()
+    return bool(visible_text and visible_text[-1] in TERMINAL_PUNCTUATION)
+
+
+def split_trailing_translation_suffix(text: str) -> Tuple[str, str]:
+    body = text
+    suffix = ""
+    while body:
+        whitespace_match = re.search(r"\s+$", body)
+        if whitespace_match:
+            suffix = body[whitespace_match.start() :] + suffix
+            body = body[: whitespace_match.start()]
+            continue
+
+        token_match = PROTECTED_TOKEN_RE.search(body)
+        if token_match and token_match.end() == len(body):
+            suffix = body[token_match.start() :] + suffix
+            body = body[: token_match.start()]
+            continue
+
+        if body[-1] in CLOSING_WRAPPERS:
+            suffix = body[-1] + suffix
+            body = body[:-1]
+            continue
+
+        break
+    return body, suffix
+
+
+def remove_added_terminal_punctuation(translated: str, source_protected_text: str) -> str:
+    if has_terminal_punctuation(source_protected_text):
+        return translated
+
+    body, suffix = split_trailing_translation_suffix(translated)
+    trimmed = body.rstrip()
+    while trimmed and trimmed[-1] in TERMINAL_PUNCTUATION:
+        trimmed = trimmed[:-1].rstrip()
+
+    if trimmed == body.rstrip():
+        return translated
+    return trimmed + suffix
+
+
 def content_to_text(content: Any) -> str:
     if isinstance(content, str):
         return content
@@ -266,6 +314,8 @@ def build_batch_messages(items: List[Dict[str, Any]], target_language: str) -> L
     system_prompt = (
         "Translate Photoshop text items to the target language. "
         "Keep tokens like [[PST_PH_000]] unchanged. "
+        "Do not add punctuation that is not present in the source text. "
+        "If source text has no ending punctuation, translated text must not add one. "
         "Return strict JSON only: {\"translations\":{\"<id>\":\"translated text\"}}. "
         "Use input ids as keys exactly once; preserve ids; do not deduplicate."
     )
@@ -313,6 +363,7 @@ def parse_batch_response(raw: str, items: List[Dict[str, Any]]) -> Dict[str, str
             raise TranslationError("Duplicate layerId in model response: %s" % layer_id)
 
         placeholders = expected[layer_id]["placeholders"]
+        translated = remove_added_terminal_punctuation(translated, expected[layer_id]["protected_text"])
         validate_placeholders(translated, placeholders)
         results[layer_id] = restore_placeholders(translated, placeholders)
 

@@ -41,24 +41,36 @@
         return ensureFolder(new Folder(Folder.temp.fsName + "/PSTranslate"));
     }
 
-    function getDefaultJsonFile() {
-        return new File(getDataFolder().fsName + "/" + JSON_FILE_NAME);
+    function createRunToken() {
+        return String(new Date().getTime()) + "_" + String(Math.floor(Math.random() * 1000000));
     }
 
-    function getExitCodeFile() {
-        return new File(getDataFolder().fsName + "/python_exit_code.txt");
+    function getRunFile(stem, extension, runToken) {
+        var suffix = runToken ? "_" + runToken : "";
+        return new File(getDataFolder().fsName + "/" + stem + suffix + extension);
     }
 
-    function getProgressFile() {
-        return new File(getDataFolder().fsName + "/python_progress.json");
+    function getDefaultJsonFile(runToken) {
+        if (!runToken) {
+            return new File(getDataFolder().fsName + "/" + JSON_FILE_NAME);
+        }
+        return getRunFile("ps_text_layers", ".json", runToken);
     }
 
-    function getRunnerBatFile() {
-        return new File(getDataFolder().fsName + "/run_ps_text_translate.bat");
+    function getExitCodeFile(runToken) {
+        return getRunFile("python_exit_code", ".txt", runToken);
     }
 
-    function getRunnerVbsFile() {
-        return new File(getDataFolder().fsName + "/run_ps_text_translate.vbs");
+    function getProgressFile(runToken) {
+        return getRunFile("python_progress", ".json", runToken);
+    }
+
+    function getRunnerBatFile(runToken) {
+        return getRunFile("run_ps_text_translate", ".bat", runToken);
+    }
+
+    function getRunnerVbsFile(runToken) {
+        return getRunFile("run_ps_text_translate", ".vbs", runToken);
     }
 
     function getScriptFolder() {
@@ -165,7 +177,7 @@
         if (typeof JSON !== "undefined" && JSON.parse) {
             return JSON.parse(text);
         }
-        return eval("(" + text + ")");
+        throw new Error("This Photoshop version does not provide JSON.parse.");
     }
 
     function readTextFile(file) {
@@ -173,9 +185,11 @@
         if (!file.open("r")) {
             throw new Error("Could not open file: " + file.fsName);
         }
-        var text = file.read();
-        file.close();
-        return text;
+        try {
+            return file.read();
+        } finally {
+            file.close();
+        }
     }
 
     function readJson(file) {
@@ -187,8 +201,11 @@
         if (!file.open("w")) {
             throw new Error("Could not open JSON for writing: " + file.fsName);
         }
-        file.write(jsonStringify(payload));
-        file.close();
+        try {
+            file.write(jsonStringify(payload));
+        } finally {
+            file.close();
+        }
     }
 
     function quoteArg(value) {
@@ -204,8 +221,11 @@
         if (!file.open("w")) {
             throw new Error("Could not open file for writing: " + file.fsName);
         }
-        file.write(text);
-        file.close();
+        try {
+            file.write(text);
+        } finally {
+            file.close();
+        }
     }
 
     function waitForFile(file, timeoutMs) {
@@ -454,6 +474,10 @@
                 log("No Python progress file update after 60 seconds; continuing to wait for exit code.");
             }
 
+            if (!sawProgress && new Date().getTime() - started > 120000) {
+                throw new Error("Python did not create a progress file within 2 minutes.");
+            }
+
             if (new Date().getTime() - started > 21600000) {
                 throw new Error("Python translation timed out after 6 hours.");
             }
@@ -609,6 +633,49 @@
         }
     }
 
+    function getDocumentId(doc) {
+        try {
+            if (typeof doc.id !== "undefined") {
+                return Number(doc.id);
+            }
+        } catch (e1) {
+        }
+        try {
+            var ref = new ActionReference();
+            ref.putProperty(charIDToTypeID("Prpr"), stringIDToTypeID("documentID"));
+            ref.putEnumerated(charIDToTypeID("Dcmn"), charIDToTypeID("Ordn"), charIDToTypeID("Trgt"));
+            var desc = executeActionGet(ref);
+            return desc.getInteger(stringIDToTypeID("documentID"));
+        } catch (e2) {
+            return null;
+        }
+    }
+
+    function normalizeDocumentPath(value) {
+        return String(value || "").replace(/\//g, "\\").toLowerCase();
+    }
+
+    function assertDocumentMatches(meta, doc) {
+        var expectedPath = String(meta.documentPath || "");
+        var actualPath = getDocumentPath(doc);
+        var expectedName = String(meta.documentName || "");
+        var expectedId = meta.documentId;
+        var actualId = getDocumentId(doc);
+
+        if (expectedPath) {
+            if (!actualPath || normalizeDocumentPath(expectedPath) !== normalizeDocumentPath(actualPath)) {
+                throw new Error("Translation JSON belongs to a different Photoshop document: " + expectedPath);
+            }
+        } else if (expectedId !== null && typeof expectedId !== "undefined" &&
+                actualId !== null && String(expectedId) !== String(actualId)) {
+            throw new Error("Translation JSON belongs to a different unsaved Photoshop document.");
+        }
+
+        if (expectedName && toLowerText(expectedName) !== toLowerText(doc.name)) {
+            throw new Error("Translation JSON document name does not match the active document.");
+        }
+    }
+
     function exportDocumentText(doc, jsonFile, progressWindow, totalTextLayers) {
         var layers = [];
         var progressState = {
@@ -619,10 +686,11 @@
 
         var payload = {
             meta: {
-                schemaVersion: 1,
+                schemaVersion: 2,
                 tool: TOOL_NAME,
                 documentName: doc.name,
                 documentPath: getDocumentPath(doc),
+                documentId: getDocumentId(doc),
                 exportedAt: isoNow(),
                 tempJson: jsonFile.fsName,
                 debug: DEBUG,
@@ -715,11 +783,7 @@
             // Do not write size/color/position/alignment back here. In some PSDs,
             // Photoshop recomposes transformed type layers when those setters run.
             if (yaHeiFontName) {
-                try {
-                    textItem.font = yaHeiFontName;
-                } catch (fontError) {
-                    log("Could not set Microsoft YaHei before editing text: " + fontError);
-                }
+                textItem.font = yaHeiFontName;
             }
 
             textItem.contents = String(translatedText);
@@ -728,14 +792,24 @@
         }
     }
 
-    function runPythonTranslation(jsonFile, progressWindow) {
+    function applyFontOnly(layer, yaHeiFontName) {
+        var originalDisplayDialogs = app.displayDialogs;
+        try {
+            app.displayDialogs = DialogModes.NO;
+            layer.textItem.font = yaHeiFontName;
+        } finally {
+            app.displayDialogs = originalDisplayDialogs;
+        }
+    }
+
+    function runPythonTranslation(jsonFile, progressWindow, runToken) {
         var scriptFolder = getScriptFolder();
         var pythonScript = new File(scriptFolder.fsName + "/" + PYTHON_SCRIPT_NAME);
         var configFile = new File(scriptFolder.fsName + "/" + CONFIG_FILE_NAME);
-        var exitCodeFile = getExitCodeFile();
-        var progressFile = getProgressFile();
-        var runnerBatFile = getRunnerBatFile();
-        var runnerVbsFile = getRunnerVbsFile();
+        var exitCodeFile = getExitCodeFile(runToken);
+        var progressFile = getProgressFile(runToken);
+        var runnerBatFile = getRunnerBatFile(runToken);
+        var runnerVbsFile = getRunnerVbsFile(runToken);
 
         if (!pythonScript.exists) {
             throw new Error("Python script was not found: " + pythonScript.fsName);
@@ -773,12 +847,17 @@
         batLines.push("cd /d " + quoteArg(scriptFolder.fsName));
         batLines.push("where py >nul 2>nul");
         batLines.push("if \"%ERRORLEVEL%\"==\"0\" goto use_py");
+        batLines.push("where python >nul 2>nul");
+        batLines.push("if not \"%ERRORLEVEL%\"==\"0\" goto no_python");
         batLines.push("  python " + pythonArgs);
         batLines.push("  set \"PST_EXIT=%ERRORLEVEL%\"");
         batLines.push("  goto done");
         batLines.push(":use_py");
         batLines.push("  py -3 " + pythonArgs);
         batLines.push("  set \"PST_EXIT=%ERRORLEVEL%\"");
+        batLines.push("  goto done");
+        batLines.push(":no_python");
+        batLines.push("  set \"PST_EXIT=9009\"");
         batLines.push(":done");
         batLines.push("echo %PST_EXIT% > " + quoteArg(exitCodeFile.fsName));
         batLines.push("exit /b %PST_EXIT%");
@@ -824,6 +903,7 @@
     function applyTranslatedText(doc, jsonFile, progressWindow) {
         var payload = readJson(jsonFile);
         var meta = payload.meta || {};
+        assertDocumentMatches(meta, doc);
         var debug = meta.debug === true;
         var dryRun = meta.dryRun === true;
         var yaHeiFontName = findMicrosoftYaHeiFont();
@@ -837,6 +917,7 @@
         collectTextLayerMap(doc, layerMap);
 
         var applied = 0;
+        var fontOnly = 0;
         var skipped = 0;
         var failed = 0;
         var hadLayerErrors = false;
@@ -857,8 +938,10 @@
         for (var i = 0; i < layers.length; i++) {
             var item = layers[i];
             var layerId = String(item.layerId);
+            var shouldApplyFontOnly = item.status === "skipped" && !dryRun && !!yaHeiFontName &&
+                (item.skipReason === "empty_text" || item.skipReason === "non_translatable");
 
-            if (item.status !== "translated") {
+            if (item.status !== "translated" && !shouldApplyFontOnly) {
                 skipped++;
                 if (item.status === "error" || item.status === "apply_error" || item.error) {
                     hadLayerErrors = true;
@@ -890,9 +973,28 @@
                 continue;
             }
 
+            if (!shouldApplyFontOnly && typeof item.translatedText !== "string") {
+                failed++;
+                hadLayerErrors = true;
+                item.status = "apply_error";
+                item.error = "translatedText must be a string.";
+                log("Invalid translatedText for layer " + layerId + ".");
+                setProgressTarget(
+                    progressWindow,
+                    mapRange(i + 1, 0, layers.length, PROGRESS_APPLY_START, PROGRESS_APPLY_END),
+                    "Skipping invalid translation: " + (item.layerName || layerId),
+                    i + 1,
+                    layers.length,
+                    null,
+                    false
+                );
+                continue;
+            }
+
             var layer = layerMap[layerId];
             if (!layer) {
                 failed++;
+                hadLayerErrors = true;
                 item.status = "apply_error";
                 item.error = "Layer not found in active document.";
                 log("Layer not found: " + layerId + " (" + item.layerPath + ")");
@@ -947,7 +1049,7 @@
             }
 
             if (appliedLayerIds[layerId]) {
-                skipped++;
+                failed++;
                 item.status = "apply_error";
                 item.error = "Duplicate layerId was already applied in this run.";
                 hadLayerErrors = true;
@@ -965,7 +1067,7 @@
             }
 
             if (appliedTargetLayerIds[targetLayerId]) {
-                skipped++;
+                failed++;
                 item.status = "apply_error";
                 item.error = "Target Photoshop layer was already applied in this run.";
                 hadLayerErrors = true;
@@ -983,14 +1085,21 @@
             }
 
             try {
-                applyText(layer, item.translatedText, yaHeiFontName);
-                item.status = "applied";
+                if (shouldApplyFontOnly) {
+                    applyFontOnly(layer, yaHeiFontName);
+                    item.status = "font_applied";
+                    fontOnly++;
+                } else {
+                    applyText(layer, item.translatedText, yaHeiFontName);
+                    item.status = "applied";
+                    applied++;
+                }
                 item.error = "";
-                applied++;
                 appliedLayerIds[layerId] = true;
                 appliedTargetLayerIds[targetLayerId] = true;
             } catch (e) {
                 failed++;
+                hadLayerErrors = true;
                 item.status = "apply_error";
                 item.error = String(e);
                 log("Failed applying layer " + layerId + ": " + e);
@@ -998,7 +1107,8 @@
             setProgressTarget(
                 progressWindow,
                 mapRange(i + 1, 0, layers.length, PROGRESS_APPLY_START, PROGRESS_APPLY_END),
-                "Replacing text layer: " + (item.layerName || layerId),
+                (shouldApplyFontOnly ? "Updating font: " : "Replacing text layer: ") +
+                    (item.layerName || layerId),
                 i + 1,
                 layers.length,
                 null,
@@ -1008,6 +1118,7 @@
 
         meta.appliedAt = isoNow();
         meta.appliedCount = applied;
+        meta.fontOnlyCount = fontOnly;
         meta.skippedCount = skipped;
         meta.applyErrorCount = failed;
         payload.meta = meta;
@@ -1034,6 +1145,7 @@
 
         return {
             applied: applied,
+            fontOnly: fontOnly,
             skipped: skipped,
             failed: failed,
             hadLayerErrors: hadLayerErrors,
@@ -1055,6 +1167,7 @@
         }
 
         lines.push("Applied: " + applyResult.applied);
+        lines.push("Font-only updated: " + applyResult.fontOnly);
         lines.push("Apply skipped: " + applyResult.skipped);
         lines.push("Apply failed: " + applyResult.failed);
 
@@ -1080,7 +1193,8 @@
         var doc = app.activeDocument;
         var originalRulerUnits = app.preferences.rulerUnits;
         var originalActiveLayer = doc.activeLayer;
-        var jsonFile = getDefaultJsonFile();
+        var runToken = createRunToken();
+        var jsonFile = getDefaultJsonFile(runToken);
         var startedAt = new Date().getTime();
         var progressWindow = null;
 
@@ -1104,13 +1218,17 @@
             if (exportedCount === 0) {
                 closeProgressWindow(progressWindow);
                 progressWindow = null;
+                removeTempFile(jsonFile, "empty translation JSON");
                 alert("No text layers were found in the active document.");
                 return;
             }
 
-            var pythonExitCode = runPythonTranslation(jsonFile, progressWindow);
+            var pythonExitCode = runPythonTranslation(jsonFile, progressWindow, runToken);
             if (!jsonFile.exists) {
                 throw new Error("Translation JSON disappeared after Python run: " + jsonFile.fsName);
+            }
+            if (pythonExitCode === 9009) {
+                throw new Error("Python 3 was not found. Install Python 3.8 or newer and try again.");
             }
             if (pythonExitCode !== 0 && pythonExitCode !== 3) {
                 throw new Error("Python translation failed before usable layer results were produced. Exit code: " + pythonExitCode);
@@ -1133,6 +1251,7 @@
             log("One-click finished. Exported=" + exportedCount +
                 ", pythonExitCode=" + pythonExitCode +
                 ", applied=" + applyResult.applied +
+                ", fontOnly=" + applyResult.fontOnly +
                 ", skipped=" + applyResult.skipped +
                 ", failed=" + applyResult.failed +
                 ", elapsed=" + formatDuration(totalSeconds));

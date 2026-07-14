@@ -136,7 +136,7 @@
         if (typeof JSON !== "undefined" && JSON.parse) {
             return JSON.parse(text);
         }
-        return eval("(" + text + ")");
+        throw new Error("This Photoshop version does not provide JSON.parse.");
     }
 
     function readJson(file) {
@@ -144,9 +144,11 @@
         if (!file.open("r")) {
             throw new Error("Could not open JSON: " + file.fsName);
         }
-        var text = file.read();
-        file.close();
-        return parseJson(text);
+        try {
+            return parseJson(file.read());
+        } finally {
+            file.close();
+        }
     }
 
     function writeJson(file, payload) {
@@ -154,8 +156,11 @@
         if (!file.open("w")) {
             throw new Error("Could not open JSON for writing: " + file.fsName);
         }
-        file.write(jsonStringify(payload));
-        file.close();
+        try {
+            file.write(jsonStringify(payload));
+        } finally {
+            file.close();
+        }
     }
 
     function getLayerId(layer) {
@@ -179,6 +184,57 @@
                 doc.activeLayer = oldLayer;
             } catch (ignored) {
             }
+        }
+    }
+
+    function getDocumentPath(doc) {
+        try {
+            return doc.fullName.fsName;
+        } catch (e) {
+            return "";
+        }
+    }
+
+    function getDocumentId(doc) {
+        try {
+            if (typeof doc.id !== "undefined") {
+                return Number(doc.id);
+            }
+        } catch (e1) {
+        }
+        try {
+            var ref = new ActionReference();
+            ref.putProperty(charIDToTypeID("Prpr"), stringIDToTypeID("documentID"));
+            ref.putEnumerated(charIDToTypeID("Dcmn"), charIDToTypeID("Ordn"), charIDToTypeID("Trgt"));
+            var desc = executeActionGet(ref);
+            return desc.getInteger(stringIDToTypeID("documentID"));
+        } catch (e2) {
+            return null;
+        }
+    }
+
+    function normalizeDocumentPath(value) {
+        return String(value || "").replace(/\//g, "\\").toLowerCase();
+    }
+
+    function assertDocumentMatches(meta, doc) {
+        var expectedPath = String(meta.documentPath || "");
+        var actualPath = getDocumentPath(doc);
+        var expectedName = String(meta.documentName || "");
+        var expectedId = meta.documentId;
+        var actualId = getDocumentId(doc);
+
+        if (expectedPath) {
+            if (!actualPath || normalizeDocumentPath(expectedPath) !== normalizeDocumentPath(actualPath)) {
+                throw new Error("Translation JSON belongs to a different Photoshop document: " + expectedPath);
+            }
+        } else if (expectedId !== null && typeof expectedId !== "undefined" &&
+                actualId !== null && String(expectedId) !== String(actualId)) {
+            throw new Error("Translation JSON belongs to a different unsaved Photoshop document.");
+        }
+
+        if (expectedName && toLowerText(expectedName) !== toLowerText(doc.name)) {
+            throw new Error("Translation JSON document name does not match the active document.");
         }
     }
 
@@ -252,103 +308,28 @@
         return fallback;
     }
 
-    function captureTextItemState(textItem) {
-        var state = {};
-        try {
-            state.size = textItem.size;
-            state.hasSize = true;
-        } catch (e1) {
-        }
-        try {
-            state.color = textItem.color;
-            state.hasColor = true;
-        } catch (e2) {
-        }
-        try {
-            state.position = textItem.position;
-            state.hasPosition = true;
-        } catch (e3) {
-        }
-        try {
-            state.justification = textItem.justification;
-            state.hasJustification = true;
-        } catch (e4) {
-        }
-        try {
-            state.width = textItem.width;
-            state.hasWidth = true;
-        } catch (e5) {
-        }
-        try {
-            state.height = textItem.height;
-            state.hasHeight = true;
-        } catch (e6) {
-        }
-        return state;
-    }
-
-    function restoreTextItemState(textItem, state) {
-        try {
-            if (state.hasSize) {
-                textItem.size = state.size;
-            }
-        } catch (e1) {
-            log("Could not restore text size: " + e1);
-        }
-        try {
-            if (state.hasColor) {
-                textItem.color = state.color;
-            }
-        } catch (e2) {
-            log("Could not restore text color: " + e2);
-        }
-        try {
-            if (state.hasJustification) {
-                textItem.justification = state.justification;
-            }
-        } catch (e3) {
-            log("Could not restore text justification: " + e3);
-        }
-        try {
-            if (state.hasWidth) {
-                textItem.width = state.width;
-            }
-        } catch (e4) {
-        }
-        try {
-            if (state.hasHeight) {
-                textItem.height = state.height;
-            }
-        } catch (e5) {
-        }
-        try {
-            if (state.hasPosition) {
-                textItem.position = state.position;
-            }
-        } catch (e6) {
-            log("Could not restore text position: " + e6);
-        }
-    }
-
     function applyText(layer, translatedText, yaHeiFontName) {
         var textItem = layer.textItem;
-        var state = captureTextItemState(textItem);
-
         var originalDisplayDialogs = app.displayDialogs;
         try {
             app.displayDialogs = DialogModes.NO;
 
             if (yaHeiFontName) {
-                try {
-                    textItem.font = yaHeiFontName;
-                } catch (fontError) {
-                    log("Could not set Microsoft YaHei before editing text: " + fontError);
-                }
+                textItem.font = yaHeiFontName;
             }
 
             textItem.contents = String(translatedText);
         } finally {
-            restoreTextItemState(textItem, state);
+            app.displayDialogs = originalDisplayDialogs;
+        }
+    }
+
+    function applyFontOnly(layer, yaHeiFontName) {
+        var originalDisplayDialogs = app.displayDialogs;
+        try {
+            app.displayDialogs = DialogModes.NO;
+            layer.textItem.font = yaHeiFontName;
+        } finally {
             app.displayDialogs = originalDisplayDialogs;
         }
     }
@@ -378,6 +359,13 @@
         }
 
         var meta = payload.meta || {};
+        try {
+            assertDocumentMatches(meta, doc);
+        } catch (documentError) {
+            log("Document validation failed: " + documentError);
+            alert("Translation JSON does not match the active document:\n" + documentError);
+            return;
+        }
         var debug = meta.debug === true;
         var dryRun = meta.dryRun === true;
         var yaHeiFontName = findMicrosoftYaHeiFont();
@@ -397,16 +385,21 @@
         }
 
         var applied = 0;
+        var fontOnly = 0;
         var skipped = 0;
         var failed = 0;
         var hadLayerErrors = false;
         var layers = payload.layers || [];
+        var appliedLayerIds = {};
+        var appliedTargetLayerIds = {};
 
         for (var i = 0; i < layers.length; i++) {
             var item = layers[i];
             var layerId = String(item.layerId);
+            var shouldApplyFontOnly = item.status === "skipped" && !dryRun && !!yaHeiFontName &&
+                (item.skipReason === "empty_text" || item.skipReason === "non_translatable");
 
-            if (item.status !== "translated") {
+            if (item.status !== "translated" && !shouldApplyFontOnly) {
                 skipped++;
                 if (item.status === "error" || item.status === "apply_error" || item.error) {
                     hadLayerErrors = true;
@@ -420,22 +413,71 @@
                 continue;
             }
 
+            if (!shouldApplyFontOnly && typeof item.translatedText !== "string") {
+                failed++;
+                hadLayerErrors = true;
+                item.status = "apply_error";
+                item.error = "translatedText must be a string.";
+                log("Invalid translatedText for layer " + layerId + ".");
+                continue;
+            }
+
             var layer = layerMap[layerId];
             if (!layer) {
                 failed++;
+                hadLayerErrors = true;
                 item.status = "apply_error";
                 item.error = "Layer not found in active document.";
                 log("Layer not found: " + layerId + " (" + item.layerPath + ")");
                 continue;
             }
 
+            var targetLayerId = "";
             try {
-                applyText(layer, item.translatedText, yaHeiFontName);
-                item.status = "applied";
+                targetLayerId = String(getLayerId(layer));
+            } catch (targetIdError) {
+                failed++;
+                hadLayerErrors = true;
+                item.status = "apply_error";
+                item.error = "Could not verify target layerId: " + targetIdError;
+                log("Could not verify target layerId for " + layerId + ": " + targetIdError);
+                continue;
+            }
+
+            if (targetLayerId !== layerId) {
+                failed++;
+                hadLayerErrors = true;
+                item.status = "apply_error";
+                item.error = "Layer mapping mismatch. Expected layerId " + layerId + ", got " + targetLayerId + ".";
+                log("Layer mapping mismatch: expected " + layerId + ", got " + targetLayerId + ".");
+                continue;
+            }
+
+            if (appliedLayerIds[layerId] || appliedTargetLayerIds[targetLayerId]) {
+                failed++;
+                hadLayerErrors = true;
+                item.status = "apply_error";
+                item.error = "Duplicate layerId or target layer in translation JSON.";
+                log("Duplicate layer mapping skipped: " + layerId + ".");
+                continue;
+            }
+
+            try {
+                if (shouldApplyFontOnly) {
+                    applyFontOnly(layer, yaHeiFontName);
+                    item.status = "font_applied";
+                    fontOnly++;
+                } else {
+                    applyText(layer, item.translatedText, yaHeiFontName);
+                    item.status = "applied";
+                    applied++;
+                }
                 item.error = "";
-                applied++;
+                appliedLayerIds[layerId] = true;
+                appliedTargetLayerIds[targetLayerId] = true;
             } catch (e3) {
                 failed++;
+                hadLayerErrors = true;
                 item.status = "apply_error";
                 item.error = String(e3);
                 log("Failed applying layer " + layerId + ": " + e3);
@@ -444,6 +486,7 @@
 
         meta.appliedAt = isoNow();
         meta.appliedCount = applied;
+        meta.fontOnlyCount = fontOnly;
         meta.skippedCount = skipped;
         meta.applyErrorCount = failed;
         payload.meta = meta;
@@ -473,8 +516,10 @@
             log("Kept temp JSON for debug/dry-run/errors: " + jsonFile.fsName);
         }
 
-        log("Apply finished. Applied=" + applied + ", skipped=" + skipped + ", failed=" + failed);
-        alert("Apply complete.\nApplied: " + applied + "\nSkipped: " + skipped + "\nFailed: " + failed);
+        log("Apply finished. Applied=" + applied + ", fontOnly=" + fontOnly +
+            ", skipped=" + skipped + ", failed=" + failed);
+        alert("Apply complete.\nApplied: " + applied + "\nFont-only updated: " + fontOnly +
+            "\nSkipped: " + skipped + "\nFailed: " + failed);
     }
 
     main();

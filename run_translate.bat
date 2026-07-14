@@ -23,13 +23,25 @@ if not exist "%CONFIG_PATH%" (
 )
 
 where py >nul 2>nul
-if "%ERRORLEVEL%"=="0" (
-    py -3 "%~dp0ps_text_translate.py" --json "%JSON_PATH%" --config "%CONFIG_PATH%" %*
-    set "EXIT_CODE=%ERRORLEVEL%"
-) else (
-    python "%~dp0ps_text_translate.py" --json "%JSON_PATH%" --config "%CONFIG_PATH%" %*
-    set "EXIT_CODE=%ERRORLEVEL%"
-)
+if "%ERRORLEVEL%"=="0" goto use_py
+
+where python >nul 2>nul
+if "%ERRORLEVEL%"=="0" goto use_python
+
+echo Python 3 was not found. Install Python 3.8 or newer and try again.
+pause
+exit /b 1
+
+:use_py
+py -3 "%~dp0ps_text_translate.py" --json "%JSON_PATH%" --config "%CONFIG_PATH%" %*
+set "EXIT_CODE=%ERRORLEVEL%"
+goto finished
+
+:use_python
+python "%~dp0ps_text_translate.py" --json "%JSON_PATH%" --config "%CONFIG_PATH%" %*
+set "EXIT_CODE=%ERRORLEVEL%"
+
+:finished
 
 echo.
 if not "%EXIT_CODE%"=="0" (

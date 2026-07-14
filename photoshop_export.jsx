@@ -206,13 +206,34 @@
         }
     }
 
+    function getDocumentId(doc) {
+        try {
+            if (typeof doc.id !== "undefined") {
+                return Number(doc.id);
+            }
+        } catch (e1) {
+        }
+        try {
+            var ref = new ActionReference();
+            ref.putProperty(charIDToTypeID("Prpr"), stringIDToTypeID("documentID"));
+            ref.putEnumerated(charIDToTypeID("Dcmn"), charIDToTypeID("Ordn"), charIDToTypeID("Trgt"));
+            var desc = executeActionGet(ref);
+            return desc.getInteger(stringIDToTypeID("documentID"));
+        } catch (e2) {
+            return null;
+        }
+    }
+
     function writeJson(file, payload) {
         file.encoding = "UTF8";
         if (!file.open("w")) {
             throw new Error("Could not open JSON for writing: " + file.fsName);
         }
-        file.write(jsonStringify(payload));
-        file.close();
+        try {
+            file.write(jsonStringify(payload));
+        } finally {
+            file.close();
+        }
     }
 
     function main() {
@@ -234,10 +255,11 @@
             var jsonFile = getDefaultJsonFile();
             var payload = {
                 meta: {
-                    schemaVersion: 1,
+                    schemaVersion: 2,
                     tool: TOOL_NAME,
                     documentName: doc.name,
                     documentPath: getDocumentPath(doc),
+                    documentId: getDocumentId(doc),
                     exportedAt: isoNow(),
                     tempJson: jsonFile.fsName,
                     debug: false,

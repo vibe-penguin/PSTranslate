@@ -2,6 +2,7 @@
 
 (function () {
     var JSON_FILE_NAME = "ps_text_layers.json";
+    var JSON_COMPAT_SCRIPT_NAME = "json_compat.jsx";
 
     function pad2(value) {
         return value < 10 ? "0" + value : String(value);
@@ -136,7 +137,29 @@
         if (typeof JSON !== "undefined" && JSON.parse) {
             return JSON.parse(text);
         }
-        throw new Error("This Photoshop version does not provide JSON.parse.");
+
+        var globalObject = null;
+        try {
+            globalObject = $.global;
+        } catch (globalError) {
+            globalObject = this;
+        }
+        if (!globalObject) {
+            globalObject = this;
+        }
+
+        if (!globalObject.PSTranslateJSON || !globalObject.PSTranslateJSON.parse) {
+            var parserFile = new File(getScriptFolder().fsName + "/" + JSON_COMPAT_SCRIPT_NAME);
+            if (!parserFile.exists) {
+                throw new Error("JSON compatibility parser was not found: " + parserFile.fsName);
+            }
+            $.evalFile(parserFile);
+        }
+
+        if (!globalObject.PSTranslateJSON || !globalObject.PSTranslateJSON.parse) {
+            throw new Error("Could not load the JSON compatibility parser.");
+        }
+        return globalObject.PSTranslateJSON.parse(text);
     }
 
     function readJson(file) {

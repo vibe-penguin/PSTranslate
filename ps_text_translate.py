@@ -474,64 +474,92 @@ def build_batch_messages(items: List[Dict[str, Any]], target_language: str) -> L
     ]
 
 
-def normalize_batch_translations(model_data: Dict[str, Any]) -> List[Tuple[str, str]]:
+def normalize_response_layer_id(value: Any) -> Optional[str]:
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        return None
+    layer_id = str(value).strip()
+    return layer_id or None
+
+
+def normalize_batch_translations(model_data: Dict[str, Any]) -> List[Tuple[str, Any]]:
     translations = model_data.get("translations")
     if isinstance(translations, dict):
-        normalized_dict: List[Tuple[str, str]] = []
-        for layer_id, translated in translations.items():
-            if not isinstance(translated, str):
-                raise TranslationError("Translation for layerId %s must be a string." % layer_id)
-            normalized_dict.append((str(layer_id), translated))
-        return normalized_dict
+        return [(str(layer_id), translated) for layer_id, translated in translations.items()]
 
     if isinstance(translations, list):
-        normalized: List[Tuple[str, str]] = []
-        for entry in translations:
+        normalized: List[Tuple[str, Any]] = []
+        for index, entry in enumerate(translations):
+            layer_id: Optional[str] = None
+            translated: Any = None
             if isinstance(entry, dict):
+                layer_id = normalize_response_layer_id(entry.get("layerId"))
                 translated = entry.get("translatedText")
-                if not isinstance(translated, str):
-                    raise TranslationError(
-                        "Translation for layerId %s must be a string." % entry.get("layerId", "")
-                    )
-                normalized.append((str(entry.get("layerId", "")), translated))
             elif isinstance(entry, list) and len(entry) >= 2:
-                if not isinstance(entry[1], str):
-                    raise TranslationError("Translation for layerId %s must be a string." % entry[0])
-                normalized.append((str(entry[0]), entry[1]))
-            else:
-                raise TranslationError("Each translation entry must be an object or [layerId, text] pair.")
+                layer_id = normalize_response_layer_id(entry[0])
+                translated = entry[1]
+
+            if layer_id is None:
+                logging.warning("Ignoring model translation entry %s because it has no usable layerId.", index)
+                continue
+            normalized.append((layer_id, translated))
         return normalized
 
     raise TranslationError("Model JSON must contain a translations object.")
 
 
-def parse_batch_response(raw: str, items: List[Dict[str, Any]]) -> Dict[str, str]:
+def parse_batch_response(
+    raw: str,
+    items: List[Dict[str, Any]],
+) -> Tuple[Dict[str, str], Dict[str, str]]:
     model_data = extract_json_object(raw)
     expected = {item["layer_id"]: item for item in items}
     results: Dict[str, str] = {}
+    errors: Dict[str, str] = {}
+    candidates: Dict[str, Any] = {}
+    duplicate_ids = set()
 
     for layer_id, translated in normalize_batch_translations(model_data):
         if layer_id not in expected:
-            raise TranslationError("Unexpected layerId in model response: %s" % layer_id)
-        if layer_id in results:
-            raise TranslationError("Duplicate layerId in model response: %s" % layer_id)
+            logging.warning("Ignoring unexpected layerId in model response: %s", layer_id)
+            continue
+        if layer_id in candidates or layer_id in duplicate_ids:
+            duplicate_ids.add(layer_id)
+            candidates.pop(layer_id, None)
+            continue
+        candidates[layer_id] = translated
 
-        placeholders = expected[layer_id]["placeholders"]
-        translated = remove_added_terminal_punctuation(translated, expected[layer_id]["protected_text"])
-        validate_placeholders(translated, placeholders)
-        visible_translation = PROTECTED_TOKEN_RE.sub("", translated).strip()
-        if not visible_translation:
-            raise TranslationError("Translation for layerId %s is empty." % layer_id)
+    for layer_id, item in expected.items():
+        if layer_id in duplicate_ids:
+            errors[layer_id] = "Duplicate layerId in model response."
+            continue
+        if layer_id not in candidates:
+            errors[layer_id] = "Missing layerId in model response."
+            continue
+
+        translated = candidates[layer_id]
+        if not isinstance(translated, str):
+            errors[layer_id] = "translatedText must be a string."
+            continue
+
+        placeholders = item["placeholders"]
+        try:
+            translated = remove_added_terminal_punctuation(translated, item["protected_text"])
+            validate_placeholders(translated, placeholders)
+            visible_translation = PROTECTED_TOKEN_RE.sub("", translated).strip()
+            if not visible_translation:
+                raise TranslationError("translatedText is empty.")
+        except TranslationError as exc:
+            errors[layer_id] = str(exc)
+            continue
         results[layer_id] = restore_placeholders(translated, placeholders)
 
-    missing = [layer_id for layer_id in expected if layer_id not in results]
-    if missing:
-        raise TranslationError("Missing layerId(s) in model response: " + ", ".join(missing[:10]))
-
-    return results
+    return results, errors
 
 
-def translate_batch_once(items: List[Dict[str, Any]], config: Dict[str, Any]) -> Dict[str, str]:
+def translate_batch_once(
+    items: List[Dict[str, Any]],
+    config: Dict[str, Any],
+) -> Tuple[Dict[str, str], Dict[str, str]]:
     target_language = str(config["target_language"])
     messages = build_batch_messages(items, target_language)
     raw = call_chat_completion(config, messages)
@@ -543,22 +571,24 @@ def translate_batch_with_retries(
     config: Dict[str, Any],
     retries: int,
     retry_delay: float,
-) -> Dict[str, str]:
+) -> Tuple[Dict[str, str], Dict[str, str]]:
     layer_ids = [item["layer_id"] for item in items]
     last_error: Optional[Exception] = None
 
     for attempt in range(retries + 1):
         attempt_started = time.time()
         try:
-            results = translate_batch_once(items, config)
+            results, errors = translate_batch_once(items, config)
             logging.info(
-                "Batch [%s] translation attempt %s/%s succeeded in %.1fs.",
+                "Batch [%s] translation attempt %s/%s completed in %.1fs: valid=%s invalid=%s.",
                 ", ".join(layer_ids),
                 attempt + 1,
                 retries + 1,
                 time.time() - attempt_started,
+                len(results),
+                len(errors),
             )
-            return results
+            return results, errors
         except Exception as exc:
             last_error = exc
             logging.warning(
@@ -586,9 +616,13 @@ def translate_batch_resilient(
     config: Dict[str, Any],
     retries: int,
     retry_delay: float,
+    partial_retries_remaining: Optional[int] = None,
 ) -> Tuple[Dict[str, str], Dict[str, str]]:
+    if partial_retries_remaining is None:
+        partial_retries_remaining = retries
+
     try:
-        return translate_batch_with_retries(items, config, retries, retry_delay), {}
+        results, errors = translate_batch_with_retries(items, config, retries, retry_delay)
     except Exception as exc:
         if len(items) == 1:
             return {}, {items[0]["layer_id"]: str(exc)}
@@ -602,11 +636,56 @@ def translate_batch_resilient(
             midpoint,
             len(items) - midpoint,
         )
-        left_results, left_errors = translate_batch_resilient(items[:midpoint], config, retries, retry_delay)
-        right_results, right_errors = translate_batch_resilient(items[midpoint:], config, retries, retry_delay)
+        left_results, left_errors = translate_batch_resilient(
+            items[:midpoint],
+            config,
+            retries,
+            retry_delay,
+            partial_retries_remaining,
+        )
+        right_results, right_errors = translate_batch_resilient(
+            items[midpoint:],
+            config,
+            retries,
+            retry_delay,
+            partial_retries_remaining,
+        )
         left_results.update(right_results)
         left_errors.update(right_errors)
         return left_results, left_errors
+
+    if not errors or partial_retries_remaining <= 0:
+        return results, errors
+
+    retry_items = [item for item in items if item["layer_id"] in errors]
+    logging.warning(
+        "Accepted %s/%s layer(s); retrying only %s invalid layer(s): %s",
+        len(results),
+        len(items),
+        len(retry_items),
+        ", ".join(item["layer_id"] for item in retry_items),
+    )
+    for item in retry_items:
+        layer_id = item["layer_id"]
+        logging.warning("Layer %s response rejected: %s", layer_id, errors[layer_id])
+    if retry_delay > 0:
+        time.sleep(retry_delay)
+
+    retry_results, retry_errors = translate_batch_resilient(
+        retry_items,
+        config,
+        retries,
+        retry_delay,
+        partial_retries_remaining - 1,
+    )
+    results.update(retry_results)
+
+    final_errors: Dict[str, str] = {}
+    for item in retry_items:
+        layer_id = item["layer_id"]
+        if layer_id not in results:
+            final_errors[layer_id] = retry_errors.get(layer_id, errors[layer_id])
+    return results, final_errors
 
 
 def iter_layers(payload: Dict[str, Any]) -> Iterable[Dict[str, Any]]:

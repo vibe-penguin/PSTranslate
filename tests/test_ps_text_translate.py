@@ -51,31 +51,37 @@ class ResponseTests(unittest.TestCase):
         token = next(iter(item["placeholders"]))
         raw = json.dumps({"translations": {"123": "你好 " + token}}, ensure_ascii=False)
 
-        result = pst.parse_batch_response(raw, [item])
+        results, errors = pst.parse_batch_response(raw, [item])
 
-        self.assertEqual("你好 %s", result["123"])
+        self.assertEqual("你好 %s", results["123"])
+        self.assertEqual({}, errors)
 
     def test_non_string_translation_is_rejected(self):
         item = make_item("123", "Hello")
         raw = json.dumps({"translations": {"123": None}})
 
-        with self.assertRaisesRegex(pst.TranslationError, "must be a string"):
-            pst.parse_batch_response(raw, [item])
+        results, errors = pst.parse_batch_response(raw, [item])
+
+        self.assertEqual({}, results)
+        self.assertRegex(errors["123"], "must be a string")
 
     def test_empty_translation_is_rejected(self):
         item = make_item("123", "Hello")
         raw = json.dumps({"translations": {"123": ""}})
 
-        with self.assertRaisesRegex(pst.TranslationError, "is empty"):
-            pst.parse_batch_response(raw, [item])
+        results, errors = pst.parse_batch_response(raw, [item])
+
+        self.assertEqual({}, results)
+        self.assertRegex(errors["123"], "is empty")
 
     def test_added_terminal_punctuation_is_removed(self):
         item = make_item("123", "Hello")
         raw = json.dumps({"translations": {"123": "你好。"}}, ensure_ascii=False)
 
-        result = pst.parse_batch_response(raw, [item])
+        results, errors = pst.parse_batch_response(raw, [item])
 
-        self.assertEqual("你好", result["123"])
+        self.assertEqual("你好", results["123"])
+        self.assertEqual({}, errors)
 
 
 class PayloadTests(unittest.TestCase):
@@ -168,7 +174,7 @@ class BatchTests(unittest.TestCase):
             call_sizes.append(len(batch))
             if len(batch) > 1:
                 raise pst.TimeoutTranslationError("simulated timeout")
-            return {batch[0]["layer_id"]: "译文"}
+            return {batch[0]["layer_id"]: "译文"}, {}
 
         with mock.patch.object(pst, "translate_batch_once", side_effect=fake_translate):
             results, errors = pst.translate_batch_resilient(
@@ -180,6 +186,119 @@ class BatchTests(unittest.TestCase):
 
         self.assertEqual([4, 2, 1, 1, 2, 1, 1], call_sizes)
         self.assertEqual(4, len(results))
+        self.assertEqual({}, errors)
+
+    def test_missing_layer_retries_only_missing_item(self):
+        items = [make_item(str(index), "Text") for index in range(20)]
+        requested_ids = []
+
+        def fake_call(config, messages):
+            request = json.loads(messages[1]["content"])
+            layer_ids = [entry[0] for entry in request["items"]]
+            requested_ids.append(layer_ids)
+            response_ids = layer_ids[:-1] if len(requested_ids) == 1 else layer_ids
+            return json.dumps(
+                {"translations": {layer_id: "译文" for layer_id in response_ids}},
+                ensure_ascii=False,
+            )
+
+        with mock.patch.object(pst, "call_chat_completion", side_effect=fake_call):
+            results, errors = pst.translate_batch_resilient(
+                items,
+                {"target_language": "简体中文"},
+                retries=2,
+                retry_delay=0,
+            )
+
+        self.assertEqual([str(index) for index in range(20)], requested_ids[0])
+        self.assertEqual(["19"], requested_ids[1])
+        self.assertEqual(2, len(requested_ids))
+        self.assertEqual(20, len(results))
+        self.assertEqual({}, errors)
+
+    def test_partial_retry_budget_is_bounded(self):
+        items = [make_item(str(index), "Text") for index in range(4)]
+        requested_ids = []
+
+        def fake_call(config, messages):
+            request = json.loads(messages[1]["content"])
+            layer_ids = [entry[0] for entry in request["items"]]
+            requested_ids.append(layer_ids)
+            translations = {
+                layer_id: "译文"
+                for layer_id in layer_ids
+                if layer_id != "3"
+            }
+            return json.dumps({"translations": translations}, ensure_ascii=False)
+
+        with mock.patch.object(pst, "call_chat_completion", side_effect=fake_call):
+            results, errors = pst.translate_batch_resilient(
+                items,
+                {"target_language": "简体中文"},
+                retries=2,
+                retry_delay=0,
+            )
+
+        self.assertEqual([["0", "1", "2", "3"], ["3"], ["3"]], requested_ids)
+        self.assertEqual(3, len(results))
+        self.assertRegex(errors["3"], "Missing layerId")
+
+    def test_placeholder_failure_retries_only_invalid_item(self):
+        items = [make_item("1", "Value %s"), make_item("2", "World")]
+        requested_ids = []
+
+        def fake_call(config, messages):
+            request = json.loads(messages[1]["content"])
+            requested_ids.append([entry[0] for entry in request["items"]])
+            translations = {}
+            for layer_id, protected_text in request["items"]:
+                if layer_id == "1" and len(requested_ids) == 1:
+                    translations[layer_id] = "值"
+                elif layer_id == "1":
+                    token = pst.PROTECTED_TOKEN_RE.search(protected_text).group(0)
+                    translations[layer_id] = "值 " + token
+                else:
+                    translations[layer_id] = "世界"
+            return json.dumps({"translations": translations}, ensure_ascii=False)
+
+        with mock.patch.object(pst, "call_chat_completion", side_effect=fake_call):
+            results, errors = pst.translate_batch_resilient(
+                items,
+                {"target_language": "简体中文"},
+                retries=2,
+                retry_delay=0,
+            )
+
+        self.assertEqual([["1", "2"], ["1"]], requested_ids)
+        self.assertEqual("值 %s", results["1"])
+        self.assertEqual("世界", results["2"])
+        self.assertEqual({}, errors)
+
+    def test_unparseable_json_retries_full_batch(self):
+        items = [make_item(str(index), "Text") for index in range(3)]
+        requested_ids = []
+
+        def fake_call(config, messages):
+            request = json.loads(messages[1]["content"])
+            layer_ids = [entry[0] for entry in request["items"]]
+            requested_ids.append(layer_ids)
+            if len(requested_ids) == 1:
+                return "not JSON"
+            return json.dumps(
+                {"translations": {layer_id: "译文" for layer_id in layer_ids}},
+                ensure_ascii=False,
+            )
+
+        with mock.patch.object(pst, "call_chat_completion", side_effect=fake_call):
+            results, errors = pst.translate_batch_resilient(
+                items,
+                {"target_language": "简体中文"},
+                retries=2,
+                retry_delay=0,
+            )
+
+        self.assertEqual([["0", "1", "2"], ["0", "1", "2"]], requested_ids)
+        self.assertEqual(3, len(results))
         self.assertEqual({}, errors)
 
 

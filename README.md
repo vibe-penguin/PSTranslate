@@ -180,7 +180,7 @@ Python 会验证：
 
 如果当前 Photoshop 的 ExtendScript 环境没有原生 `JSON.parse`，`photoshop_translate.jsx` 和 `photoshop_apply.jsx` 会使用各自内嵌的兼容解析器。兼容解析器只解析标准 JSON，不使用 `eval`，也不会执行 JSON 中的表达式。
 
-若整个 batch 返回异常，脚本会重试；多图层请求超时会立即二分拆小，避免在同一个过大请求上反复等待。最终失败的图层标记为 `error`，Photoshop 会跳过且继续处理其他图层。
+模型返回可解析的 `translations` 后，Python 会逐个 `layerId` 校验并立即保留合法译文。缺少 ID、空译文、类型错误或占位符损坏时，只把对应失败图层组成更小的请求重试，不会重复翻译同批中已经成功的图层。只有整个响应无法解析、缺少 `translations` 结构或 API 请求失败时才重试当前完整 batch；多图层请求超时会立即二分拆小。最终失败的图层标记为 `error`，Photoshop 会跳过且继续处理其他图层。
 
 无需翻译的文字图层不会调用 LLM。如果 Photoshop 找到微软雅黑，这些图层仍会执行仅换字体；翻译失败或读取失败的图层会完全跳过。
 
